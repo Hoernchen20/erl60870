@@ -1,0 +1,376 @@
+# IEC 60870 Erlang Library — Design
+
+Status: phases 0–1 implemented (skeleton + ASDU codec); phase 2 (APCI /
+connection state machine) is next. Authoritative copy; the published artifact is
+a rendered snapshot.
+
+## 1. Scope
+
+- **Phase 1:** IEC 60870-5-104 **server** (controlled station), Edition 2 (2006), with redundancy.
+- **Phase 2:** IEC 60870-5-104 **client** (controlling station).
+- **Phase 3:** IEC 60870-5-101 (serial), reusing the shared application layer.
+- OTP 26+, rebar3, `ranch` for the acceptor and TLS transport.
+- Multiple independent servers and clients per node, started and supervised by the
+  user or by the library.
+
+## 2. Module layering
+
+The application layer (ASDU) is identical for 101 and 104 — 104 is the companion
+standard of 101. Only the lower layers differ. The ASDU layer stays completely
+transport-free so the 101 phase is mostly "add a link layer".
+
+```
+apps/iec60870/
+  include/
+    iec60870_asdu.hrl          records: #asdu{}, #object{}, #qds{}, #cp56{}  (public)
+  src/
+    asdu/
+      iec60870_asdu.erl        APDU/ASDU record <-> binary + object builders
+      iec60870_type.erl        per-Type-ID encode/decode dispatch
+      iec60870_type_*.erl      (optional split) M_SP_NA_1, M_ME_NC_1, C_SC_NA_1, ...
+      iec60870_cot.erl         cause-of-transmission atom <-> integer
+    104/
+      iec60870_104_apci.erl     start byte, length, I/S/U control fields, seq numbers
+      iec60870_104_conn.erl     gen_statem: per-socket APCI state machine + timers
+      iec60870_104_listener.erl ranch protocol callback, redundancy-group assignment
+    101/                        (phase 3)
+      iec60870_101_link.erl
+    core/
+      iec60870.erl               top-level convenience API (start_server/2, ...)
+      iec60870_server.erl        user-facing server API + behaviour definition
+      iec60870_server_sup.erl
+      iec60870_server_ctl.erl    gen_server: config, callback state, command router
+      iec60870_rgroup_sup.erl
+      iec60870_rgroup.erl        gen_statem: active-conn arbitration + event buffer
+      iec60870_registry.erl      gen_server: instance name -> pid (also {via,_,_})
+      iec60870_instances_sup.erl DynamicSupervisor for library-managed instances
+      iec60870_data_model.erl    behaviour
+      iec60870_dm_ets.erl        default ETS-backed data model
+    iec60870_app.erl
+    iec60870_sup.erl
+```
+
+`iec60870_asdu.hrl` lives in `include/` rather than `src/asdu/`: the records are
+part of the public surface (user code assembling ASDUs by hand, section 8), and
+`include/` is what `-include_lib("iec60870/include/...")` resolves to.
+
+## 3. Supervision tree
+
+One subtree per user-created server, grafted either under the library's
+`iec60870_instances_sup` (via `iec60870:start_server/2`) or under the user's own
+supervisor (via `iec60870_server:start_link/1`).
+
+```
+iec60870_sup                     one_for_one, app root
+├── iec60870_registry            gen_server, ETS owner (names -> pids)
+└── iec60870_instances_sup       DynamicSupervisor
+    └── iec60870_server_sup      per server, rest_for_one
+        ├── iec60870_server_ctl      gen_server — config, callback module + state,
+        │                            command routing, data-model handle
+        ├── iec60870_dm_ets          ETS table owner (or user's data-model process)
+        ├── iec60870_rgroup_sup      DynamicSupervisor
+        │   └── iec60870_rgroup      gen_statem, one per redundancy group:
+        │                            member list, active connection, event buffer
+        ├── iec60870_conn_sup        ranch connection supervisor (DynamicSupervisor)
+        │   └── iec60870_104_conn    gen_statem, one per TCP/TLS socket
+        └── iec60870_104_listener    ranch listener (accept + transport + TLS)
+```
+
+`rest_for_one`, children ordered as listed: if `server_ctl` or the data model
+dies, everything to its right (groups, connections, listener) restarts; a single
+connection crash is isolated by `conn_sup`.
+
+## 4. APCI / connection state machine
+
+`iec60870_104_conn`, a `gen_statem`, one per socket.
+
+### Frame formats
+
+```
+APDU = APCI (6 octets) + ASDU (0..249 octets)      ; APDU max 253
+
+APCI:  68  LEN  CF1 CF2 CF3 CF4
+       │   │    └──────────────  control field, format-dependent
+       │   └─ length of APDU minus the 2 start octets (1..253)
+       └─ start
+
+I-format  CF1.b0 = 0    send seq N(S) in CF1..CF2, recv seq N(R) in CF3..CF4  (carries ASDU)
+S-format  CF1 = 0x01    recv seq N(R) in CF3..CF4                             (ack only)
+U-format  CF1 = 0x03+   STARTDT / STOPDT / TESTFR, act or con                 (no seq)
+```
+
+### States
+
+| State | Meaning | I-frames | On entry |
+|---|---|---|---|
+| `connected` | socket up, STARTDT not received (STOPDT state) | not sent; incoming rejected | start t3 |
+| `active` | STARTDT_ACT received, STARTDT_CON sent — data transfer running | sent & processed | flush event buffer |
+| `active_standby` | in a redundancy group; another connection is the active one | not sent; incoming still parsed | — |
+
+Driven by U-frames (STARTDT/STOPDT/TESTFR act/con), I-frames, S-frames, and the
+timers below. `STOPDT_ACT` → finish outstanding I-frames, send `STOPDT_CON`,
+return to `connected`.
+
+### Timers (defaults, all configurable)
+
+| Timer | Default | Fires when | Action |
+|---|---|---|---|
+| t0 | 30 s | connection not established | abort connect (client side) |
+| t1 | 15 s | sent I / U(TESTFR/STARTDT/STOPDT) not acknowledged | close connection |
+| t2 | 10 s | I-frames received, no S-frame sent yet (t2 < t1) | send S-frame ack |
+| t3 | 20 s | nothing received while idle | send TESTFR_ACT |
+
+### Flow control
+
+- `k` (default 12): max I-frames sent but not yet acknowledged. Window full ⇒ stop sending, wait for S/I ack.
+- `w` (default 8, ≤ ⅔·k): send an S-frame after receiving `w` I-frames at the latest.
+- 15-bit sequence numbers, modulo 32768. Per connection: V(S) send counter, V(R) receive counter, ack-state. Invalid N(R)/N(S) ⇒ close connection.
+
+## 5. Redundancy groups
+
+`iec60870_rgroup`, a `gen_statem`, one per group.
+
+### Modes (`redundancy.mode`)
+
+| Mode | Behaviour |
+|---|---|
+| `connection` | each accepted connection is its own group — classic multi-master, no redundancy |
+| `single` | all connections share one group; exactly one `active` at a time |
+| `multiple` | explicitly configured groups; connection matched to a group by peer IP, else the default group |
+
+```erlang
+redundancy => #{
+  mode => multiple,
+  groups => [
+    #{name => scada_a, match => [{ip, {10,0,0,0}, 24}], buffer => 5000},
+    #{name => scada_b, match => [{ip, {10,1,0,5}, 32}]}
+  ],
+  default => #{name => other, buffer => 200}
+}
+```
+
+### Active-connection arbitration
+
+Only one member connection may be `active`. When a member receives `STARTDT_ACT`
+while another member is active, `iec60870_rgroup` moves the previous active
+connection to `active_standby` (stops its I-frame flow, keeps the socket) and
+promotes the new one. The controlling station is responsible for the orderly
+STOPDT/STARTDT handover; the server also tolerates an abrupt switch (dead TCP plus
+`STARTDT` on a sibling).
+
+### Event buffer + switchover replay
+
+- Each group owns an **ordered, bounded queue of ASDUs** awaiting transmission.
+  Overflow policy: drop-oldest (configurable), raise a data-model overflow flag.
+- Every queued ASDU gets a monotonic buffer index. The active connection is
+  granted a send window from the queue; on S-frame ack it reports "released
+  through index N"; released entries are dropped.
+- On promotion of a new active connection, transmission resumes from the **last
+  released index** — sent-but-unacknowledged ASDUs are repeated on the new
+  connection. Duplicates on the wire during switchover are expected and acceptable.
+- While a group has **no** active connection, events keep accumulating up to the bound.
+
+## 6. Data model
+
+Pluggable via the `iec60870_data_model` behaviour; the library ships
+`iec60870_dm_ets` and uses it by default.
+
+```erlang
+-callback init(Args :: term()) -> {ok, State}.
+-callback terminate(State) -> ok.
+
+%% current-value store (shared; read for interrogation & no-change suppression)
+-callback read(State, Coa, Ioa) -> {ok, point()} | not_found.
+-callback write(State, Coa, Ioa, point()) -> {ok, State, changed :: boolean()}.
+
+%% interrogation: fold the points that belong to (Coa, InterrogationGroup)
+-callback fold(State, Coa, ig() | station, fun((point(), Acc) -> Acc), Acc) -> Acc.
+-callback coas(State) -> [Coa].
+
+%% counters (for counter interrogation), optional
+-callback read_counter(State, Coa, Ioa) -> {ok, counter()} | not_found.
+-callback freeze_counters(State, Coa, qcc()) -> {ok, State}.
+```
+
+`point()` carries: type id, value, quality descriptor, timestamp,
+interrogation-group assignment, and cyclic/background flags.
+
+Two conceptually separate stores — do not conflate:
+
+| Store | Scope | Purpose |
+|---|---|---|
+| current values | per common address, shared across the server | answer interrogation; suppress no-change spontaneous events |
+| event queue | per redundancy group (§5) | spontaneous transmission + switchover replay |
+
+## 7. Commands
+
+The library runs **all protocol mechanics**; the callback module performs **only
+the semantic action** and may answer asynchronously.
+
+### Callback behaviour (`iec60870_server` behaviour)
+
+```erlang
+-callback init(Args) -> {ok, CbState}.
+
+-callback select(command(), CbState) ->
+      {accept, CbState} | {reject, cause(), CbState}.
+
+-callback execute(command(), CbState) ->
+      {ok, CbState}
+    | {ok, term_info(), CbState}
+    | {error, cause(), CbState}
+    | {async, ref(), CbState}.          %% later: iec60870_server:command_result(Ref, Result)
+
+-callback clock_sync(Coa, cp56(), CbState) ->
+      {ok, CbState} | {error, cause(), CbState}.
+
+-callback interrogation(Coa, qoi(), CbState) ->
+      {ok, CbState}                     %% let the data model answer it (default)
+    | {ok, [asdu_spec()], CbState}.     %% supply the dump explicitly
+
+-callback counter_interrogation(Coa, qcc(), CbState) -> {ok, CbState}.
+
+-callback connection_event(event(), CbState) -> {ok, CbState}.
+      %% event() :: {up | down, peer()} | {activated | deactivated, group()}
+```
+
+### Interrogation (C_IC_NA_1) — library-driven
+
+1. recv `act` (COT 6) → validate COA / QOI
+2. send `act_con` (COT 7), P/N negative if invalid
+3. call `interrogation/3`, then stream the current values with COT
+   `interrogated_station` (20) or `interrogated_group_n` (21–36), batched into ASDUs
+4. send `act_term` (COT 10)
+
+### Single / Double command (C_SC_NA_1 / C_DC_NA_1)
+
+- **Direct execute:** recv `act` → `execute/2` → `act_con` (7, P/N per result) →
+  `act_term` (10). Persistent commands also produce return information (COT 11/12)
+  from the data model.
+- **Select-before-operate:** recv select (S/E = 1, `act`) → `select/2` → select
+  `act_con` → recv execute (S/E = 0, `act`) → execute `act_con` → `execute/2` →
+  `act_term`. Library enforces the select timeout and that execute matches the
+  selected object.
+- `{async, Ref, _}` ⇒ library holds `act_term` until
+  `iec60870_server:command_result(Ref, ok | {error, Cause})`. The connection
+  process never blocks.
+
+### Clock sync (C_CS_NA_1)
+
+recv → `clock_sync/3` → `act_con`. The kept clock offset feeds timestamping of
+subsequently generated events. Config option for masters that expect no `act_con`.
+
+## 8. Sending information objects
+
+### High level (default data model)
+
+```erlang
+iec60870_server:update(Server, {Coa, Ioa}, #{
+    type  => m_me_nc_1,
+    value => 3.14,
+    qds   => [],   %% [] | [invalid, not_topical, blocked, substituted, overflow]
+    ts    => erlang:system_time(millisecond)   %% omit for the "no timestamp" variant
+}).
+```
+
+The library writes the current-value store and, **iff changed**, builds a
+spontaneous ASDU (COT 3) and enqueues it into every redundancy group's buffer. On
+flush it batches objects of equal `{type, COA, COT}` into single ASDUs (≤ 249
+octets; SQ=0, or SQ=1 sequence for contiguous IOAs), then hands them to each
+active connection subject to its `k` window and t1.
+
+Bulk form: `iec60870_server:update(Server, [{{Coa, Ioa}, Spec}, ...])`.
+
+### Low level (escape hatch)
+
+```erlang
+iec60870_server:send_asdu(Server, GroupSelector,
+    #{type => ..., coa => ..., cot => ..., objects => [...]}).
+```
+
+`GroupSelector :: all | {group, Name} | {coa, Coa}`. Bypasses the current-value
+store; still respects buffering and flow control.
+
+### Builders
+
+`iec60870_asdu:single_point/3`, `measured_value_short/4`, `step_position/4`, …
+return the internal `#object{}`; used by both the codec and user code assembling
+ASDUs by hand.
+
+## 9. Public API
+
+```erlang
+{ok, Pid} = iec60870:start_server(my_rtu, #{
+    transport => {tcp, [{port, 2404}, {ip, {0,0,0,0}}]},
+    common_addresses => [1],
+    redundancy => #{mode => single, buffer => 5000},
+    data_model => {iec60870_dm_ets, #{points => "priv/points.eterm"}},
+    callback   => {my_rtu_app, #{}},
+    params     => #{k => 12, w => 8, t1 => 15000, t2 => 10000, t3 => 20000,
+                    max_asdu => 249, coa_size => 2, ioa_size => 3, cot_size => 2,
+                    orig_addr => enabled}
+}).
+
+iec60870_server:update(my_rtu, {1, 100}, #{type => m_sp_tb_1, value => true, qds => []}).
+iec60870_server:command_result(Ref, ok).
+iec60870:stop_server(my_rtu).
+```
+
+`Name :: atom() | {via, Mod, Term} | pid()`. `iec60870_server:start_link/1`
+returns the per-server supervisor for embedding in a user tree;
+`iec60870:start_server/2` puts it under the library.
+
+## 10. Type IDs — v1
+
+| Dir | Type IDs |
+|---|---|
+| Monitor | M_SP_NA_1 (1), M_SP_TB_1 (30), M_DP_NA_1 (3), M_DP_TB_1 (31), M_ST_NA_1 (5), M_ME_NA_1 (9), M_ME_NB_1 (11), M_ME_NC_1 (13), M_ME_TD_1 (34), M_ME_TE_1 (35), M_ME_TF_1 (36), M_IT_NA_1 (15), M_IT_TB_1 (37) |
+| Control | C_SC_NA_1 (45), C_DC_NA_1 (46), C_RC_NA_1 (47), C_SE_NA_1 / NB_1 / NC_1 (48–50) |
+| System | C_IC_NA_1 (100), C_CI_NA_1 (101), C_RD_NA_1 (102), C_CS_NA_1 (103), C_TS_TA_1 (107), M_EI_NA_1 (70) |
+
+CP56Time2a only for timestamped variants; CP24Time2a / CP16Time2a not in v1.
+
+## 11. TLS (IEC 62351-3)
+
+`transport => {tls, SslOpts}`. Defaults: `versions [tlsv1.2, tlsv1.3]`,
+`verify_peer`, `fail_if_no_peer_cert true` (mutual auth is the field norm),
+explicit `ciphers`, optional CRL / peer-cert allowlist via `verify_fun`. Secure
+port convention 19998. Delivered through `ranch_ssl` — mostly pass-through of OTP
+`ssl` options with strict defaults and a `verify_none` opt-out for lab use.
+
+## 12. Decisions
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Edition | Edition 2 (2006) — redundancy, CP56Time2a |
+| 2 | Acceptor | `ranch` (brings the TLS transport) |
+| 3 | Redundancy scope | all three modes from v1 |
+| 4 | Data model | pluggable behaviour + default ETS implementation |
+| 5 | Data representation | maps at the public API, records internally |
+| 6 | Type ID scope | table in §10 |
+| 7 | Async commands | yes — `{async, Ref}` + `command_result/2` |
+| 8 | Tooling | rebar3, OTP 26+ |
+
+## 13. Implementation phases
+
+0. **Skeleton (done):** rebar3 umbrella, CI matrix (OTP 26–28) running
+   compile + xref + eunit + dialyzer, `iec60870_asdu.hrl`, `ranch` dep, Apache-2.0
+   licence. App boots to `iec60870_sup` → {`iec60870_registry`, `iec60870_instances_sup`}.
+1. **ASDU codec (done):** `iec60870_asdu` (DUI framing, `encode/2` + `decode/2`
+   over configurable COT/COA/IOA widths, object builders), `iec60870_type`
+   (type-id map + per-element payload codec for all §10 types), `iec60870_cot`,
+   `iec60870_cp56`. eunit spec byte-vectors + `proper` full round-trip
+   (`decode(encode(A)) == A`) across every type, both structure qualifiers, all
+   field widths.
+2. APCI codec + `iec60870_104_conn` (single connection): STARTDT/STOPDT/TESTFR,
+   k/w, t1/t2/t3, 15-bit seq-number arithmetic (`proper`); `common_test` driving
+   raw sockets.
+3. `iec60870_dm_ets` + interrogation + `update/3` spontaneous path + batching.
+4. Commands: single / double / setpoint, direct + SBO, clock sync, async execute.
+5. Redundancy: `iec60870_rgroup`, all three modes, event buffer, switchover replay; multi-socket `common_test`.
+6. TLS transport + 62351-3 defaults.
+7. Counter interrogation, end-of-init, test command, background scan, read command, parameter of measured value.
+8. Docs, `examples/`, interop test vs `lib60870` / a real master.
+
+Then: **client** (reuses ASDU + APCI + a group-less connection). Then: **101**
+(new link layer, same ASDU layer).
