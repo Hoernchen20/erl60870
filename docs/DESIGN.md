@@ -1,8 +1,8 @@
 # IEC 60870 Erlang Library — Design
 
-Status: phases 0–1 implemented (skeleton + ASDU codec); phase 2 (APCI /
-connection state machine) is next. Authoritative copy; the published artifact is
-a rendered snapshot.
+Status: phases 0–2 implemented (skeleton + ASDU codec + APCI / single-connection
+state machine); phase 3 (default data model + interrogation + spontaneous path)
+is next. Authoritative copy; the published artifact is a rendered snapshot.
 
 ## 1. Scope
 
@@ -32,7 +32,9 @@ apps/iec60870/
     104/
       iec60870_104_apci.erl     start byte, length, I/S/U control fields, seq numbers
       iec60870_104_conn.erl     gen_statem: per-socket APCI state machine + timers
-      iec60870_104_listener.erl ranch protocol callback, redundancy-group assignment
+                                (also the ranch_protocol callback)
+      iec60870_104_listener.erl ranch:start_listener wrapper; redundancy-group
+                                assignment added in phase 5
     101/                        (phase 3)
       iec60870_101_link.erl
     core/
@@ -125,6 +127,25 @@ return to `connected`.
 - `k` (default 12): max I-frames sent but not yet acknowledged. Window full ⇒ stop sending, wait for S/I ack.
 - `w` (default 8, ≤ ⅔·k): send an S-frame after receiving `w` I-frames at the latest.
 - 15-bit sequence numbers, modulo 32768. Per connection: V(S) send counter, V(R) receive counter, ack-state. Invalid N(R)/N(S) ⇒ close connection.
+
+### Owner interface (phase 2)
+
+Until the redundancy group and `server_ctl` exist, `iec60870_104_conn` talks to
+a single **owner** process, configured on the listener. The owner drives
+transmission with `iec60870_104_conn:send_asdu/2` (an ASDU leaves as an I-frame
+once `active` and the `k` window has room, otherwise it waits in a bounded
+`outbox`) and receives, as `{iec60870, ConnPid, Payload}`:
+
+| Payload | When |
+|---|---|
+| `activated` / `deactivated` | entered / left `active` (STARTDT / STOPDT done) |
+| `{asdu, #asdu{}}` | a decoded incoming ASDU |
+| `{decode_error, Reason}` | an I-frame whose ASDU payload would not parse (connection kept) |
+| `{outbox_overflow, N}` | `send_asdu/2` dropped the oldest queued ASDU |
+| `{closed, Reason}` | connection gone: `t1_timeout`, `peer_closed`, `{socket_error, _}`, `{protocol_error, _}` |
+
+In phase 5 the redundancy group becomes the owner and the listener assigns each
+connection to a group by peer address.
 
 ## 5. Redundancy groups
 
@@ -354,17 +375,22 @@ port convention 19998. Delivered through `ranch_ssl` — mostly pass-through of 
 ## 13. Implementation phases
 
 0. **Skeleton (done):** rebar3 umbrella, CI matrix (OTP 26–28) running
-   compile + xref + eunit + dialyzer, `iec60870_asdu.hrl`, `ranch` dep, Apache-2.0
-   licence. App boots to `iec60870_sup` → {`iec60870_registry`, `iec60870_instances_sup`}.
+   compile + xref + eunit + ct + dialyzer, `iec60870_asdu.hrl`, `ranch` dep,
+   Apache-2.0 licence. App boots to `iec60870_sup` →
+   {`iec60870_registry`, `iec60870_instances_sup`}.
 1. **ASDU codec (done):** `iec60870_asdu` (DUI framing, `encode/2` + `decode/2`
    over configurable COT/COA/IOA widths, object builders), `iec60870_type`
    (type-id map + per-element payload codec for all §10 types), `iec60870_cot`,
    `iec60870_cp56`. eunit spec byte-vectors + `proper` full round-trip
    (`decode(encode(A)) == A`) across every type, both structure qualifiers, all
    field widths.
-2. APCI codec + `iec60870_104_conn` (single connection): STARTDT/STOPDT/TESTFR,
-   k/w, t1/t2/t3, 15-bit seq-number arithmetic (`proper`); `common_test` driving
-   raw sockets.
+2. **APCI + single connection (done):** `iec60870_104_apci` (I/S/U frame codec
+   + 15-bit sequence arithmetic), `iec60870_104_conn` (`gen_statem`:
+   `connected`/`active`, STARTDT/STOPDT/TESTFR, k/w window, t1/t2/t3, N(S)/N(R)
+   validation, bounded outbox), thin `iec60870_104_listener` over `ranch`. eunit
+   spec byte-vectors + `proper` (frame round-trip, sequence arithmetic);
+   `common_test` drives the state machine over raw client sockets. Owner seam:
+   a per-listener pid (see §4).
 3. `iec60870_dm_ets` + interrogation + `update/3` spontaneous path + batching.
 4. Commands: single / double / setpoint, direct + SBO, clock sync, async execute.
 5. Redundancy: `iec60870_rgroup`, all three modes, event buffer, switchover replay; multi-socket `common_test`.
