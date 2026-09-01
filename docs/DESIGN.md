@@ -67,30 +67,40 @@ supervisor (via `iec60870_server:start_link/1`).
 
 ```
 iec60870_sup                     one_for_one, app root
-├── iec60870_registry            gen_server, ETS owner (names -> pids)
+├── iec60870_registry            gen_server, ETS owner (names -> pids;
+│                                also {rgroup_sup, Name} / {ctl, Name})
 └── iec60870_instances_sup       DynamicSupervisor
     └── iec60870_server_sup      per server, rest_for_one
-        ├── iec60870_server_ctl      gen_server — config, callback module + state,
-        │                            command routing, data-model handle
-        ├── iec60870_dm_ets          ETS table owner (or user's data-model process)
-        ├── iec60870_rgroup_sup      DynamicSupervisor
-        │   └── iec60870_rgroup      gen_statem, one per redundancy group:
-        │                            member list, active connection, event buffer
-        ├── iec60870_conn_sup        ranch connection supervisor (DynamicSupervisor)
-        │   └── iec60870_104_conn    gen_statem, one per TCP/TLS socket
-        └── iec60870_104_listener    ranch listener (accept + transport + TLS)
+        ├── iec60870_rgroup_sup      one_for_one; the redundancy groups
+        │   └── iec60870_rgroup      gen_statem, one per group: members, active
+        │                            connection, bounded event buffer, replay
+        └── iec60870_server_ctl      gen_server — config, callback module + state,
+                                     command routing, data model handle; also
+                                     starts the ranch listener (interim)
 ```
 
-`rest_for_one`, children ordered as listed: if `server_ctl` or the data model
-dies, everything to its right (groups, connections, listener) restarts; a single
-connection crash is isolated by `conn_sup`.
+`rest_for_one`, children in start order. `rgroup_sup` is **first** so
+`server_ctl` can resolve it (`{rgroup_sup, Name}` in `iec60870_registry` —
+siblings started in one supervisor `init` cannot pass pids directly). Effects:
 
-**Phase-3 interim.** Only `iec60870_server_ctl` exists as a child so far. It is
-also the connection owner (section 4) and, until the redundancy layer lands in
-phase 5, it starts the `ranch` listener itself (`owner => self()`) and hosts the
+- `rgroup_sup` dies → `server_ctl` restarts too (rebuilds against fresh groups).
+- `server_ctl` dies alone → the groups, their buffered events and the live
+  connections **survive**; the listener is stopped and restarted (established
+  sockets are unaffected).
+
+Each redundancy group is the `owner` (section 4) of its member connections. The
+listener is handed a resolver `fun((PeerIp) -> {ok, GroupPid} | {error, _})`
+that `iec60870_104_conn` calls just after `ranch:handshake` — this is how a
+connection is assigned to a group by peer address. Groups relay incoming ASDUs
+and connection lifecycle events to `server_ctl` (`iec60870_server_ctl:relay/3`).
+
+**Deferred (not in phase 5).** `server_ctl` still starts the `ranch` listener
+itself rather than through a supervised `child_spec`, and still hosts the
 default data model's `public` ETS table (`iec60870_dm_ets:init/1` runs in this
-process). `rgroup_sup`, `conn_sup` and a standalone data-model process arrive
-with phase 5; point values do not survive a `server_ctl` restart yet.
+process) — so a standalone data-model process and a supervised listener /
+`conn_sup` node are still future work, and point values do not survive a
+`server_ctl` restart. Per-connection crashes are already isolated by ranch's
+own connection supervisor.
 
 ## 4. APCI / connection state machine
 
@@ -116,12 +126,17 @@ U-format  CF1 = 0x03+   STARTDT / STOPDT / TESTFR, act or con                 (n
 | State | Meaning | I-frames | On entry |
 |---|---|---|---|
 | `connected` | socket up, STARTDT not received (STOPDT state) | not sent; incoming rejected | start t3 |
-| `active` | STARTDT_ACT received, STARTDT_CON sent — data transfer running | sent & processed | flush event buffer |
-| `active_standby` | in a redundancy group; another connection is the active one | not sent; incoming still parsed | — |
+| `active` | STARTDT_ACT received, STARTDT_CON sent — data transfer running | sent & processed | drain outbox |
 
 Driven by U-frames (STARTDT/STOPDT/TESTFR act/con), I-frames, S-frames, and the
 timers below. `STOPDT_ACT` → finish outstanding I-frames, send `STOPDT_CON`,
 return to `connected`.
+
+**`active_standby` is not a connection state.** A redundancy group with more
+than one `active` member simply stops feeding the non-chosen ones its event
+buffer (section 5); at the APCI layer they stay fully `active` and keep
+answering their own direct requests (interrogation, commands). This is simpler
+than a wire-level park and closer to how a hot-standby master actually behaves.
 
 ### Timers (defaults, all configurable)
 
@@ -138,24 +153,31 @@ return to `connected`.
 - `w` (default 8, ≤ ⅔·k): send an S-frame after receiving `w` I-frames at the latest.
 - 15-bit sequence numbers, modulo 32768. Per connection: V(S) send counter, V(R) receive counter, ack-state. Invalid N(R)/N(S) ⇒ close connection.
 
-### Owner interface (phase 2)
+### Owner interface
 
-Until the redundancy group and `server_ctl` exist, `iec60870_104_conn` talks to
-a single **owner** process, configured on the listener. The owner drives
-transmission with `iec60870_104_conn:send_asdu/2` (an ASDU leaves as an I-frame
-once `active` and the `k` window has room, otherwise it waits in a bounded
-`outbox`) and receives, as `{iec60870, ConnPid, Payload}`:
+`iec60870_104_conn` talks to a single **owner** process. The listener's `owner`
+option is either a static pid (direct embedding, tests) or a
+`fun((PeerIp) -> {ok, pid()} | {error, _})` resolved once per socket right after
+`ranch:handshake` — phase 5 passes a fun that returns the connection's
+`iec60870_rgroup`.
+
+The owner drives transmission with `iec60870_104_conn:send_asdu/2,3` (an ASDU
+leaves as an I-frame once `active` and the `k` window has room, otherwise it
+waits in a bounded `outbox`) and receives, as `{iec60870, ConnPid, Payload}`:
 
 | Payload | When |
 |---|---|
 | `activated` / `deactivated` | entered / left `active` (STARTDT / STOPDT done) |
 | `{asdu, #asdu{}}` | a decoded incoming ASDU |
+| `{released, Tag}` | the peer acknowledged the I-frame carrying a `send_asdu/3` tagged ASDU (highest tag; monotonic) |
 | `{decode_error, Reason}` | an I-frame whose ASDU payload would not parse (connection kept) |
-| `{outbox_overflow, N}` | `send_asdu/2` dropped the oldest queued ASDU |
+| `{outbox_overflow, N}` | `send_asdu` dropped the oldest queued ASDU |
 | `{closed, Reason}` | connection gone: `t1_timeout`, `peer_closed`, `{socket_error, _}`, `{protocol_error, _}` |
 
-In phase 5 the redundancy group becomes the owner and the listener assigns each
-connection to a group by peer address.
+`send_asdu/3` carries an opaque tag (the redundancy group passes its buffer
+index); `send_asdu/2` is `/3` with `undefined` and is never echoed. Direct
+command / interrogation replies from `server_ctl` use `/2` and go straight to
+the requesting connection, bypassing the group buffer.
 
 ## 5. Redundancy groups
 
@@ -172,34 +194,43 @@ connection to a group by peer address.
 ```erlang
 redundancy => #{
   mode => multiple,
+  buffer => 1000,                 %% default per-group bound (all modes)
   groups => [
     #{name => scada_a, match => [{ip, {10,0,0,0}, 24}], buffer => 5000},
     #{name => scada_b, match => [{ip, {10,1,0,5}, 32}]}
   ],
-  default => #{name => other, buffer => 200}
+  default => #{buffer => 200}     %% unmatched peers; the `default' group always exists
 }
 ```
 
+`match` entries are `{ip, BaseAddr, PrefixLen}` (IPv4 or IPv6), tested in order,
+first group to match wins (`iec60870_rgroup:match/3`). With `mode` absent the
+default is `connection`, which preserves the pre-phase-5 multi-master behaviour.
+
 ### Active-connection arbitration
 
-Only one member connection may be `active`. When a member receives `STARTDT_ACT`
-while another member is active, `iec60870_rgroup` moves the previous active
-connection to `active_standby` (stops its I-frame flow, keeps the socket) and
-promotes the new one. The controlling station is responsible for the orderly
-STOPDT/STARTDT handover; the server also tolerates an abrupt switch (dead TCP plus
-`STARTDT` on a sibling).
+At most one member is fed the event buffer. When a member enters `active`
+(STARTDT) while another already holds that role, `iec60870_rgroup` promotes the
+newcomer and simply stops feeding the previous one (which stays open — see the
+`active_standby` note in section 4). The controlling station is responsible for
+the orderly STOPDT/STARTDT handover; the server also tolerates an abrupt switch
+(dead TCP plus `STARTDT` on a sibling).
 
 ### Event buffer + switchover replay
 
-- Each group owns an **ordered, bounded queue of ASDUs** awaiting transmission.
-  Overflow policy: drop-oldest (configurable), raise a data-model overflow flag.
-- Every queued ASDU gets a monotonic buffer index. The active connection is
-  granted a send window from the queue; on S-frame ack it reports "released
-  through index N"; released entries are dropped.
-- On promotion of a new active connection, transmission resumes from the **last
-  released index** — sent-but-unacknowledged ASDUs are repeated on the new
-  connection. Duplicates on the wire during switchover are expected and acceptable.
-- While a group has **no** active connection, events keep accumulating up to the bound.
+- Each group owns an **ordered, bounded queue of ASDUs**, each with a monotonic
+  index. Overflow: drop-oldest (the dropped index counts as released).
+- New ASDUs are appended by `iec60870_server_ctl` (`iec60870_rgroup:enqueue/2`,
+  one copy per group) and, if a connection is active, sent on immediately via
+  `iec60870_104_conn:send_asdu/3` tagged with their index.
+- `{released, Index}` from the active connection (the peer acknowledged the
+  I-frame) drops every buffer entry `=< Index`.
+- On promotion, the whole remaining buffer (everything past the last released
+  index) is re-sent to the new active connection. Duplicates on the wire during
+  switchover are expected and acceptable.
+- While a group has **no** active connection, events keep accumulating up to the
+  bound.
+- The data-model overflow flag on drop is not raised yet (deferred).
 
 ## 6. Data model
 
@@ -472,7 +503,16 @@ port convention 19998. Delivered through `ranch_ssl` — mostly pass-through of 
    event-timestamps part is deferred). eunit for the pure helpers
    (`iec60870_command_tests`); `iec60870_server_SUITE` drives direct/SBO/
    async commands and clock sync over a raw client socket.
-5. Redundancy: `iec60870_rgroup`, all three modes, event buffer, switchover replay; multi-socket `common_test`.
+5. **Redundancy (done):** `iec60870_rgroup` (`gen_statem` — members, active
+   connection, bounded per-group event buffer with index/`{released, _}`
+   accounting and switchover replay) under `iec60870_rgroup_sup` (static groups
+   for `single`/`multiple`, one temporary group per connection for
+   `connection`); `iec60870_104_conn` gains `send_asdu/3` tags + a resolver-fun
+   `owner`; `iec60870_server_ctl` broadcasts spontaneous ASDUs to every group
+   and no longer buffers itself. `active_standby` is a group-level property, not
+   a connection state; the standalone data-model / supervised-listener nodes
+   stay deferred. eunit `iec60870_rgroup_tests` (peer-address matcher);
+   multi-socket `iec60870_rgroup_SUITE` (all three modes + switchover replay).
 6. TLS transport + 62351-3 defaults.
 7. Counter interrogation, end-of-init, test command, background scan, read command, parameter of measured value.
 8. Docs, `examples/`, interop test vs `lib60870` / a real master.

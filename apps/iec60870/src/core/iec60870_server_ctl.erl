@@ -1,33 +1,35 @@
-%%% @doc Server control process — config, data model, callback state, and the
-%%% connection owner (docs/DESIGN.md sections 4, 7, 8).
+%%% @doc Server control process — config, data model and callback state
+%%% (docs/DESIGN.md sections 4-8).
 %%%
 %%% One `gen_server' per server. It:
 %%%
 %%% <ul>
-%%%   <li>starts and owns the `ranch' listener, passing itself as the
-%%%       {@link iec60870_104_conn} owner (phase-3 interim — the redundancy
-%%%       group takes this over in phase 5);</li>
+%%%   <li>starts the `ranch' listener, handing each connection a resolver fun
+%%%       that assigns it to an {@link iec60870_rgroup} by peer address
+%%%       (interim — the listener is still started here, see the phase-3 note
+%%%       in docs/DESIGN.md section 3);</li>
 %%%   <li>owns the default data model's ETS table
 %%%       ({@link iec60870_dm_ets:init/1} runs in this process);</li>
 %%%   <li>answers station / group interrogation (C_IC_NA_1) from the data
 %%%       model, batched via {@link iec60870_batch};</li>
-%%%   <li>turns {@link iec60870_server:update/3} into spontaneous ASDUs, held in
-%%%       a bounded drop-oldest buffer while no connection is active;</li>
+%%%   <li>turns {@link iec60870_server:update/3} into spontaneous ASDUs and
+%%%       hands them to every redundancy group (each buffers / replays on its
+%%%       own — docs/DESIGN.md section 5);</li>
 %%%   <li>runs commands (C_SC/C_DC/C_RC/C_SE) — direct execute and
 %%%       select-before-operate, sync or async — and clock sync (C_CS),
 %%%       docs/DESIGN.md section 7.</li>
 %%% </ul>
 %%%
-%%% Multiple active connections all receive spontaneous and low-level traffic
-%%% (the future `redundancy => connection' semantics); interrogation and
-%%% commands are answered on the requesting connection. Counter interrogation
-%%% is answered with a negative confirmation until phase 7.
+%%% The redundancy groups own the connections; they {@link relay/3} incoming
+%%% ASDUs and connection lifecycle events here. Interrogation and command
+%%% replies are sent straight back on the requesting connection. Counter
+%%% interrogation is answered with a negative confirmation until phase 7.
 -module(iec60870_server_ctl).
 -behaviour(gen_server).
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
--export([start_link/2]).
+-export([start_link/2, relay/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
@@ -37,15 +39,11 @@
     orig_addr = 0              :: 0..255,
     asdu_opts = #{}            :: iec60870_asdu:opts(),
     listener_ref               :: ranch:ref() | undefined,
+    rgroup_sup                  :: pid(),
     dm_mod                     :: module(),
     dm_state                   :: iec60870_data_model:state(),
     cb_mod = undefined         :: module() | undefined,
     cb_state = undefined       :: term(),
-    %% conn pid -> {active | inactive, monitor ref}
-    conns = #{}                :: #{pid() => {active | inactive, reference()}},
-    buffer = queue:new()       :: queue:queue(#asdu{}),
-    buffer_len = 0             :: non_neg_integer(),
-    buffer_max = 1000          :: pos_integer(),
     select_timeout = 10000     :: pos_integer(),
     clock_sync_con = true      :: boolean(),
     %% {Coa, Ioa} -> outstanding select (docs/DESIGN.md section 7)
@@ -66,6 +64,13 @@
 start_link(Name, Config) ->
     gen_server:start_link(?MODULE, {Name, Config}, []).
 
+%% @doc Called by an {@link iec60870_rgroup} to hand an owner message
+%% (`{asdu, _}', `activated', `deactivated', `{closed, _}', ...) from one of
+%% its member connections up to this control process.
+-spec relay(pid(), pid(), term()) -> ok.
+relay(Ctl, Conn, Payload) ->
+    gen_server:cast(Ctl, {owner_event, Conn, Payload}).
+
 %%%===================================================================
 %%% gen_server
 %%%===================================================================
@@ -73,6 +78,16 @@ start_link(Name, Config) ->
 -spec init({term(), map()}) -> {ok, #state{}} | {stop, term()}.
 init({Name, Config}) ->
     process_flag(trap_exit, true),
+    case iec60870_registry:whereis_name({rgroup_sup, Name}) of
+        RgroupSup when is_pid(RgroupSup) ->
+            _ = iec60870_registry:unregister_name({ctl, Name}),
+            yes = iec60870_registry:register_name({ctl, Name}, self()),
+            do_init(Name, Config, RgroupSup);
+        undefined ->
+            {stop, {rgroup_sup_not_registered, Name}}
+    end.
+
+do_init(Name, Config, RgroupSup) ->
     Params = maps:get(params, Config, #{}),
     AsduOpts = #{cot_size => maps:get(cot_size, Params, 2),
                  coa_size => maps:get(coa_size, Params, 2),
@@ -84,7 +99,8 @@ init({Name, Config}) ->
         {ok, CbMod, CbState} ->
             Ref = {iec60870_server, Name},
             _ = iec60870_104_listener:stop(Ref),
-            ListenerOpts = #{owner => self(), transport => Transport,
+            Resolver = make_resolver(Config, RgroupSup, Name),
+            ListenerOpts = #{owner => Resolver, transport => Transport,
                              transport_opts => TOpts, params => Params},
             case iec60870_104_listener:start(Ref, ListenerOpts) of
                 {ok, _} ->
@@ -94,18 +110,51 @@ init({Name, Config}) ->
                         orig_addr = maps:get(orig_addr, Params, 0),
                         asdu_opts = AsduOpts,
                         listener_ref = Ref,
+                        rgroup_sup = RgroupSup,
                         dm_mod = DmMod, dm_state = DmState,
                         cb_mod = CbMod, cb_state = CbState,
-                        buffer_max = buffer_max(Config),
                         select_timeout = maps:get(select_timeout, Config, 10000),
                         clock_sync_con = maps:get(clock_sync_confirm, Config, true)}};
                 {error, Reason} ->
                     _ = DmMod:terminate(DmState),
+                    _ = iec60870_registry:unregister_name({ctl, Name}),
                     {stop, {listener_failed, Reason}}
             end;
         {error, Reason} ->
             _ = DmMod:terminate(DmState),
+            _ = iec60870_registry:unregister_name({ctl, Name}),
             {stop, {callback_failed, Reason}}
+    end.
+
+%% One resolver fun per listener, called by each {@link iec60870_104_conn} with
+%% its peer IP to pick (or, for `connection' mode, spawn) its redundancy group.
+make_resolver(Config, RgroupSup, Name) ->
+    Red = maps:get(redundancy, Config, #{}),
+    DefaultBuffer = maps:get(buffer, Red, 1000),
+    case maps:get(mode, Red, connection) of
+        connection ->
+            fun(_PeerIp) ->
+                iec60870_rgroup_sup:start_dynamic(RgroupSup, DefaultBuffer,
+                                                  Name, self())
+            end;
+        single ->
+            fun(_PeerIp) -> join(RgroupSup, default) end;
+        multiple ->
+            Groups = maps:get(groups, Red, []),
+            fun(PeerIp) ->
+                join(RgroupSup, iec60870_rgroup:match(PeerIp, Groups, default))
+            end
+    end.
+
+%% Runs in the connecting {@link iec60870_104_conn}'s init: pick the static
+%% group for `Id' and register this connection (`self()') as a member.
+join(RgroupSup, Id) ->
+    case iec60870_rgroup_sup:group_pid(RgroupSup, Id) of
+        undefined ->
+            {error, {no_group, Id}};
+        Pid ->
+            ok = iec60870_rgroup:add_member(Pid, self()),
+            {ok, Pid}
     end.
 
 handle_call(port, _From, #state{listener_ref = Ref} = State) ->
@@ -119,13 +168,11 @@ handle_cast({send_asdu, _Selector, Spec}, State) ->
     {noreply, dispatch([spec_to_asdu(Spec)], State)};
 handle_cast({command_result, Ref, Result}, State) ->
     {noreply, resolve_command(Ref, Result, State)};
+handle_cast({owner_event, Conn, Payload}, State) ->
+    handle_owner(Payload, Conn, State);
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({iec60870, Conn, Payload}, State) ->
-    handle_owner(Payload, Conn, State);
-handle_info({'DOWN', _Mon, process, Pid, _Reason}, #state{conns = Conns} = State) ->
-    {noreply, State#state{conns = maps:remove(Pid, Conns)}};
 handle_info({timeout, TRef, {select_expired, Key}}, #state{selects = Selects} = State) ->
     State1 = case Selects of
                  #{Key := #{timer := TRef}} -> State#state{selects = maps:remove(Key, Selects)};
@@ -135,9 +182,10 @@ handle_info({timeout, TRef, {select_expired, Key}}, #state{selects = Selects} = 
 handle_info(_Msg, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{listener_ref = Ref, dm_mod = DmMod, dm_state = DmState,
-                          pending = Pending}) ->
+terminate(_Reason, #state{name = Name, listener_ref = Ref, dm_mod = DmMod,
+                          dm_state = DmState, pending = Pending}) ->
     _ = maps:foreach(fun(Ref1, _) -> iec60870_registry:unbind_command(Ref1) end, Pending),
+    _ = iec60870_registry:unregister_name({ctl, Name}),
     _ = case Ref of
             undefined -> ok;
             _ -> iec60870_104_listener:stop(Ref)
@@ -149,25 +197,17 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %%%===================================================================
-%%% Owner messages from iec60870_104_conn
+%%% Owner messages, relayed from an iec60870_rgroup (see relay/3)
 %%%===================================================================
 
 handle_owner(activated, Conn, State) ->
-    State1 = flush_buffer(Conn, track(Conn, active, State)),
-    {noreply, cb_event({activated, Conn}, State1)};
+    {noreply, cb_event({activated, Conn}, State)};
 handle_owner(deactivated, Conn, State) ->
-    {noreply, cb_event({deactivated, Conn}, track(Conn, inactive, State))};
+    {noreply, cb_event({deactivated, Conn}, State)};
 handle_owner({asdu, Asdu}, Conn, State) ->
     route(Asdu, Conn, State);
-handle_owner({closed, Reason}, Conn, #state{conns = Conns} = State) ->
-    State1 = case maps:take(Conn, Conns) of
-                 {{_, Mon}, Rest} ->
-                     _ = demonitor(Mon, [flush]),
-                     State#state{conns = Rest};
-                 error ->
-                     State
-             end,
-    {noreply, cb_event({down, Conn, Reason}, State1)};
+handle_owner({closed, Reason}, Conn, State) ->
+    {noreply, cb_event({down, Conn, Reason}, State)};
 handle_owner({decode_error, Reason}, _Conn, #state{name = Name} = State) ->
     logger:warning("iec60870 server ~p: incoming ASDU decode error: ~p",
                    [Name, Reason]),
@@ -178,16 +218,6 @@ handle_owner({outbox_overflow, Dropped}, _Conn, #state{name = Name} = State) ->
     {noreply, State};
 handle_owner(_Other, _Conn, State) ->
     {noreply, State}.
-
-track(Conn, Status, #state{conns = Conns} = State) ->
-    Entry = case Conns of
-                #{Conn := {_, Mon}} -> {Status, Mon};
-                _ -> {Status, monitor(process, Conn)}
-            end,
-    State#state{conns = Conns#{Conn => Entry}}.
-
-active_conns(#state{conns = Conns}) ->
-    [Conn || Conn := {active, _} <- Conns].
 
 %%%===================================================================
 %%% Incoming ASDU routing
@@ -503,38 +533,23 @@ spontaneous_groups(Changed) ->
     maps:to_list(ByKey).
 
 %%%===================================================================
-%%% Dispatch / buffering
+%%% Dispatch
 %%%===================================================================
 
-dispatch(Asdus, State) ->
-    case active_conns(State) of
-        [] ->
-            lists:foldl(fun buffer_push/2, State, Asdus);
-        Conns ->
-            lists:foreach(
-              fun(Asdu) ->
-                      lists:foreach(fun(Conn) -> send_to(Conn, Asdu) end, Conns)
-              end, Asdus),
-            State
-    end.
+%% Spontaneous / low-level traffic goes to every redundancy group; each group
+%% buffers it, sends it on to its own active connection, and replays it across
+%% a switchover (docs/DESIGN.md section 5).
+dispatch(Asdus, #state{rgroup_sup = RgroupSup} = State) ->
+    Groups = iec60870_rgroup_sup:which_groups(RgroupSup),
+    lists:foreach(
+      fun(Group) ->
+              lists:foreach(fun(Asdu) -> iec60870_rgroup:enqueue(Group, Asdu) end,
+                            Asdus)
+      end, Groups),
+    State.
 
-buffer_push(Asdu, #state{buffer = Q, buffer_len = N, buffer_max = Max,
-                         name = Name} = State) ->
-    case N >= Max of
-        true ->
-            logger:warning("iec60870 server ~p: spontaneous buffer full (~p), "
-                           "dropping oldest", [Name, Max]),
-            State#state{buffer = queue:in(Asdu, queue:drop(Q))};
-        false ->
-            State#state{buffer = queue:in(Asdu, Q), buffer_len = N + 1}
-    end.
-
-flush_buffer(_Conn, #state{buffer_len = 0} = State) ->
-    State;
-flush_buffer(Conn, #state{buffer = Q} = State) ->
-    lists:foreach(fun(Asdu) -> send_to(Conn, Asdu) end, queue:to_list(Q)),
-    State#state{buffer = queue:new(), buffer_len = 0}.
-
+%% Interrogation / command / clock-sync replies go straight back on the
+%% requesting connection, bypassing the group buffer.
 send_to(Conn, Asdu) ->
     iec60870_104_conn:send_asdu(Conn, Asdu).
 
@@ -569,9 +584,6 @@ cb_event(Event, #state{cb_mod = CbMod, cb_state = CbState} = State) ->
 
 transport({Transport, Opts}) when is_list(Opts) -> {Transport, Opts};
 transport(Transport) when is_atom(Transport) -> {Transport, []}.
-
-buffer_max(Config) ->
-    maps:get(buffer, maps:get(redundancy, Config, #{}), 1000).
 
 spec_to_asdu(#{type := Type, coa := Coa, cot := Cot} = Spec) ->
     #asdu{type = Type, coa = Coa, cot = Cot,

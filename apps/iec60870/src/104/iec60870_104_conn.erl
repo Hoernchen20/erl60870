@@ -18,8 +18,11 @@
 %%% by its redundancy group) arrives with phase 5.
 %%%
 %%% This module is the `ranch_protocol' callback; {@link iec60870_104_listener}
-%%% wires it to a listening socket. The owner is a single static pid per
-%%% listener for now; per-connection redundancy-group assignment is phase 5.
+%%% wires it to a listening socket. The `owner' listener option is either a
+%%% static pid (phase 2-4 style, and direct embedding) or a
+%%% `fun((PeerIp) -> {ok, pid()} | {error, term()})' resolved once per socket
+%%% just after `ranch:handshake' — that is how phase 5 assigns each connection
+%%% to its {@link iec60870_rgroup} by peer address.
 -module(iec60870_104_conn).
 -behaviour(gen_statem).
 -behaviour(ranch_protocol).
@@ -29,7 +32,7 @@
 %% ranch_protocol
 -export([start_link/3]).
 %% owner API
--export([send_asdu/2, stop/1]).
+-export([send_asdu/2, send_asdu/3, stop/1]).
 %% gen_statem
 -export([init/1, callback_mode/0, handle_event/4, terminate/3, code_change/4]).
 
@@ -50,9 +53,17 @@
         {iec60870, pid(), activated}
       | {iec60870, pid(), deactivated}
       | {iec60870, pid(), {asdu, #asdu{}}}
+      | {iec60870, pid(), {released, non_neg_integer()}}
       | {iec60870, pid(), {decode_error, iec60870_asdu:decode_error()}}
       | {iec60870, pid(), {outbox_overflow, non_neg_integer()}}
       | {iec60870, pid(), {closed, closed_reason()}}.
+
+%% An opaque per-ASDU tag supplied to {@link send_asdu/3}: the sender's own
+%% identifier (the redundancy group passes its buffer index), echoed back in a
+%% `{released, Tag}' owner message once the peer acknowledges the I-frame that
+%% carried it. `undefined' (from {@link send_asdu/2}) is never echoed.
+-type send_tag() :: non_neg_integer() | undefined.
+-export_type([send_tag/0]).
 
 -define(DEFAULT_PARAMS,
         #{k => 12, w => 8,
@@ -81,10 +92,12 @@
     acked_vr = 0             :: iec60870_104_apci:seq(),
     %% received I-frames since we last sent an acknowledgement (drives w / t2).
     recv_since_ack = 0       :: non_neg_integer(),
-    %% sent-but-unacknowledged I-frames: {seq, monotonic ms when sent} (drives t1).
-    sent = queue:new()       :: queue:queue({iec60870_104_apci:seq(), integer()}),
-    %% ASDUs waiting on the k window or on STARTDT.
-    outbox = queue:new()     :: queue:queue(#asdu{}),
+    %% sent-but-unacknowledged I-frames: {seq, monotonic ms when sent, send_tag()}
+    %% (drives t1; the tag drives `{released, _}' owner notifications).
+    sent = queue:new()       :: queue:queue({iec60870_104_apci:seq(), integer(),
+                                             send_tag()}),
+    %% ASDUs waiting on the k window or on STARTDT, each with its send_tag().
+    outbox = queue:new()     :: queue:queue({#asdu{}, send_tag()}),
     outbox_len = 0           :: non_neg_integer(),
     %% false | monotonic ms when we sent an unanswered TESTFR_ACT.
     testfr_pending = false   :: false | integer(),
@@ -104,7 +117,14 @@ start_link(Ref, Transport, ProtoOpts) ->
 %% connection is `active' and the `k' window has room; otherwise it waits.
 -spec send_asdu(gen_statem:server_ref(), #asdu{}) -> ok.
 send_asdu(Conn, #asdu{} = Asdu) ->
-    gen_statem:cast(Conn, {send_asdu, Asdu}).
+    send_asdu(Conn, Asdu, undefined).
+
+%% @doc As {@link send_asdu/2}, but tag the ASDU: once the peer acknowledges the
+%% I-frame that carries it the owner is sent `{iec60870, ConnPid, {released,
+%% Tag}}'. The redundancy group uses this to release its event buffer.
+-spec send_asdu(gen_statem:server_ref(), #asdu{}, send_tag()) -> ok.
+send_asdu(Conn, #asdu{} = Asdu, Tag) ->
+    gen_statem:cast(Conn, {send_asdu, Asdu, Tag}).
 
 %% @doc Close the connection without notifying the owner (the owner asked).
 -spec stop(gen_statem:server_ref()) -> ok.
@@ -118,7 +138,7 @@ stop(Conn) ->
 -spec init({ranch:ref(), module(), map()}) -> no_return().
 init({Ref, Transport, ProtoOpts}) ->
     {ok, Socket} = ranch:handshake(Ref),
-    Owner = maps:get(owner, ProtoOpts),
+    Owner = resolve_owner(maps:get(owner, ProtoOpts), Transport, Socket),
     Mon = monitor(process, Owner),
     Params = validate_params(
                maps:merge(?DEFAULT_PARAMS, maps:get(params, ProtoOpts, #{}))),
@@ -134,6 +154,20 @@ init({Ref, Transport, ProtoOpts}) ->
 -spec callback_mode() -> gen_statem:callback_mode_result().
 callback_mode() ->
     [handle_event_function, state_enter].
+
+%% A static pid is the owner directly (phase 2-4 style, direct embedding); a
+%% 1-arity fun is resolved against the peer IP (phase 5 group assignment).
+resolve_owner(Pid, _Transport, _Socket) when is_pid(Pid) ->
+    Pid;
+resolve_owner(Fun, Transport, Socket) when is_function(Fun, 1) ->
+    {ok, {PeerIp, _Port}} = Transport:peername(Socket),
+    case Fun(PeerIp) of
+        {ok, Pid} when is_pid(Pid) ->
+            Pid;
+        Other ->
+            _ = Transport:close(Socket),
+            exit({owner_resolution_failed, Other})
+    end.
 
 %%%-------------------------------------------------------------------
 %%% state enter
@@ -209,16 +243,16 @@ handle_event({timeout, t3}, t3, _State, Data0) ->
 %%% owner casts
 %%%-------------------------------------------------------------------
 
-handle_event(cast, {send_asdu, Asdu}, active, #data{stopping = false} = Data0) ->
+handle_event(cast, {send_asdu, Asdu, Tag}, active, #data{stopping = false} = Data0) ->
     case window_open(Data0) of
         true ->
-            Data = transmit_i(Asdu, Data0),
+            Data = transmit_i(Asdu, Tag, Data0),
             {keep_state, Data, [t1_action(Data), {{timeout, t2}, cancel}]};
         false ->
-            {keep_state, enqueue(Asdu, Data0)}
+            {keep_state, enqueue(Asdu, Tag, Data0)}
     end;
-handle_event(cast, {send_asdu, Asdu}, _State, Data0) ->
-    {keep_state, enqueue(Asdu, Data0)};
+handle_event(cast, {send_asdu, Asdu, Tag}, _State, Data0) ->
+    {keep_state, enqueue(Asdu, Tag, Data0)};
 handle_event(cast, stop, _State, _Data) ->
     {stop, normal};
 
@@ -315,15 +349,26 @@ progress(Data, Extra) ->
 %%%===================================================================
 
 %% Apply a received N(R): drop the I-frames it acknowledges, advance `ack',
-%% and use the freed window to drain the outbox.
-apply_ack(NR, #data{sent = Sent} = Data) ->
-    drain_outbox(Data#data{sent = drop_acked(Sent, NR), ack = NR}).
+%% tell the owner about any tagged ASDUs now released, and use the freed window
+%% to drain the outbox.
+apply_ack(NR, #data{sent = Sent} = Data0) ->
+    {Sent1, Tags} = drop_acked(Sent, NR, []),
+    Data = notify_released(Tags, Data0),
+    drain_outbox(Data#data{sent = Sent1, ack = NR}).
 
-drop_acked(Sent, NR) ->
+drop_acked(Sent, NR, Tags) ->
     case queue:peek(Sent) of
-        {value, {Seq, _}} when Seq =:= NR -> Sent;
-        {value, _} -> drop_acked(queue:drop(Sent), NR);
-        empty -> Sent
+        {value, {Seq, _Ts, _Tag}} when Seq =:= NR -> {Sent, lists:reverse(Tags)};
+        {value, {_Seq, _Ts, Tag}} -> drop_acked(queue:drop(Sent), NR, [Tag | Tags]);
+        empty -> {Sent, lists:reverse(Tags)}
+    end.
+
+%% Indices are monotonic, so the highest released tag implies all the lower
+%% ones — one `{released, _}' message per acknowledgement is enough.
+notify_released(Tags, Data) ->
+    case [T || T <- Tags, T =/= undefined] of
+        [] -> Data;
+        Idxs -> notify(Data, {released, lists:max(Idxs)}), Data
     end.
 
 %% Send an S-frame now if `w' received I-frames are unacknowledged, else make
@@ -352,26 +397,26 @@ drain_outbox(#data{outbox_len = 0} = Data) ->
 drain_outbox(#data{outbox = Q, outbox_len = N} = Data) ->
     case window_open(Data) of
         true ->
-            {{value, Asdu}, Q1} = queue:out(Q),
-            drain_outbox(transmit_i(Asdu, Data#data{outbox = Q1, outbox_len = N - 1}));
+            {{value, {Asdu, Tag}}, Q1} = queue:out(Q),
+            drain_outbox(transmit_i(Asdu, Tag, Data#data{outbox = Q1, outbox_len = N - 1}));
         false ->
             Data
     end.
 
-transmit_i(Asdu, #data{vs = Vs, vr = Vr, sent = Sent, asdu_opts = Opts} = Data) ->
+transmit_i(Asdu, Tag, #data{vs = Vs, vr = Vr, sent = Sent, asdu_opts = Opts} = Data) ->
     Bin = iec60870_asdu:encode(Asdu, Opts),
     Data1 = send_frame(Data, {i, Vs, Vr, Bin}),
     Data1#data{vs = iec60870_104_apci:seq_succ(Vs),
-               sent = queue:in({Vs, now_ms()}, Sent),
+               sent = queue:in({Vs, now_ms(), Tag}, Sent),
                acked_vr = Vr, recv_since_ack = 0}.
 
-enqueue(Asdu, #data{outbox = Q, outbox_len = N, params = #{max_outbox := Max}} = Data) ->
+enqueue(Asdu, Tag, #data{outbox = Q, outbox_len = N, params = #{max_outbox := Max}} = Data) ->
     case N >= Max of
         true ->
             notify(Data, {outbox_overflow, N}),
-            Data#data{outbox = queue:in(Asdu, queue:drop(Q))};
+            Data#data{outbox = queue:in({Asdu, Tag}, queue:drop(Q))};
         false ->
-            Data#data{outbox = queue:in(Asdu, Q), outbox_len = N + 1}
+            Data#data{outbox = queue:in({Asdu, Tag}, Q), outbox_len = N + 1}
     end.
 
 send_frame(#data{transport = T, socket = S} = Data, Frame) ->
@@ -403,7 +448,7 @@ t1_action(#data{sent = Sent, testfr_pending = TP, params = #{t1 := T1}}) ->
 earliest_pending(Sent, TP) ->
     TsList = [Ts || Ts <- [TP], is_integer(Ts)] ++
         case queue:peek(Sent) of
-            {value, {_Seq, Ts}} -> [Ts];
+            {value, {_Seq, Ts, _Tag}} -> [Ts];
             empty -> []
         end,
     case TsList of

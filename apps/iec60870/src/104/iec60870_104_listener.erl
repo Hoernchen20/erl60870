@@ -2,18 +2,22 @@
 %%% that accepts TCP (or TLS) connections and runs {@link iec60870_104_conn} on
 %%% each (docs/DESIGN.md section 3).
 %%%
-%%% Phase-2 scope: one listener, one static set of protocol options. Every
-%%% accepted connection reports to the same `owner' pid. Per-connection
-%%% redundancy-group assignment (matching the peer address to a group) lands in
-%%% phase 5; `child_spec/2' is provided so a server subtree can supervise the
-%%% listener then.
+%%% One listener, one static set of protocol options. The `owner' is either a
+%%% static pid (every accepted connection reports to it) or a
+%%% `fun((PeerIp) -> {ok, pid()} | {error, term()})' that {@link
+%%% iec60870_104_conn} resolves per socket after the handshake — that is how
+%%% phase 5 assigns each connection to its redundancy group by peer address.
+%%% `child_spec/2' is provided so a server subtree can supervise the listener.
 -module(iec60870_104_listener).
 
 -export([start/2, stop/1, port/1, child_spec/2]).
 
--export_type([opts/0]).
+-export_type([opts/0, owner/0]).
 
--type opts() :: #{owner := pid(),
+-type owner() :: pid()
+               | fun((inet:ip_address()) -> {ok, pid()} | {error, term()}).
+
+-type opts() :: #{owner := owner(),
                   transport => tcp | tls | module(),
                   transport_opts => [term()],
                   params => map()}.
@@ -39,7 +43,7 @@ child_spec(Name, Opts) ->
     {Transport, RanchOpts, ProtoOpts} = translate(Opts),
     ranch:child_spec(Name, Transport, RanchOpts, iec60870_104_conn, ProtoOpts).
 
-translate(#{owner := Owner} = Opts) when is_pid(Owner) ->
+translate(#{owner := Owner} = Opts) when is_pid(Owner); is_function(Owner, 1) ->
     Transport = case maps:get(transport, Opts, tcp) of
                     tcp -> ranch_tcp;
                     tls -> ranch_ssl;

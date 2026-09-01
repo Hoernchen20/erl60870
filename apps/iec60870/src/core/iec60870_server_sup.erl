@@ -1,10 +1,16 @@
 %%% @doc Per-server supervision subtree (docs/DESIGN.md section 3).
 %%%
-%%% Phase-3 shape: a single `iec60870_server_ctl' worker, which is also the
-%%% connection owner and (for now) starts the `ranch' listener itself and owns
-%%% the default data model's ETS table. The `rest_for_one' strategy and the
-%%% dedicated `rgroup_sup' / `conn_sup' / data-model children arrive with
-%%% phase 5.
+%%% `rest_for_one', children in start order:
+%%%
+%%% <ol>
+%%%   <li>{@link iec60870_rgroup_sup} — the redundancy groups. Started first so
+%%%       {@link iec60870_server_ctl} can resolve it (`{rgroup_sup, Name}' in
+%%%       {@link iec60870_registry}). A ctl-only crash therefore leaves the
+%%%       groups, their buffered events and the live connections intact.</li>
+%%%   <li>{@link iec60870_server_ctl} — config, data model, callback state,
+%%%       command routing; also starts the `ranch' listener (interim — see the
+%%%       phase-3 note in docs/DESIGN.md section 3).</li>
+%%% </ol>
 -module(iec60870_server_sup).
 -behaviour(supervisor).
 
@@ -28,7 +34,13 @@ ctl(Sup) ->
 init({Name, Config}) ->
     SupFlags = #{strategy => rest_for_one, intensity => 4, period => 30},
     Children =
-        [#{id => iec60870_server_ctl,
+        [#{id => iec60870_rgroup_sup,
+           start => {iec60870_rgroup_sup, start_link, [Name, Config]},
+           type => supervisor,
+           restart => permanent,
+           shutdown => infinity,
+           modules => [iec60870_rgroup_sup]},
+         #{id => iec60870_server_ctl,
            start => {iec60870_server_ctl, start_link, [Name, Config]},
            type => worker,
            restart => permanent,

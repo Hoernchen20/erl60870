@@ -114,8 +114,8 @@ update(Server, Writes) when is_list(Writes) ->
     gen_server:cast(ctl(Server), {update, Writes}).
 
 %% @doc Send a hand-built ASDU. `Selector' (`all | {group, _} | {coa, _}') is
-%% accepted for forward compatibility; in phase 3 every active connection gets
-%% it. Bypasses the current-value store.
+%% accepted for forward compatibility; for now every redundancy group gets it
+%% (so its active connection does). Bypasses the current-value store.
 -spec send_asdu(server_ref(), all | {group, term()} | {coa, 0..65535}, asdu_spec()) -> ok.
 send_asdu(Server, Selector, Spec) when is_map(Spec) ->
     gen_server:cast(ctl(Server), {send_asdu, Selector, Spec}).
