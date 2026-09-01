@@ -12,18 +12,26 @@
 %%%       spontaneous (COT 3) ASDU to every active connection;</li>
 %%%   <li>the library answers station / group interrogation from the data model
 %%%       on its own;</li>
-%%%   <li>{@link send_asdu/3} is the escape hatch for hand-built ASDUs.</li>
+%%%   <li>{@link send_asdu/3} is the escape hatch for hand-built ASDUs;</li>
+%%%   <li>{@link command_result/2} resolves an `{async, Ref, _}' returned from
+%%%       the `execute/2' callback.</li>
 %%% </ul>
 %%%
-%%% The callback module is optional in phase 3. When supplied it may implement
-%%% `interrogation/3' (override or supplement the automatic dump) and
-%%% `connection_event/2'; `select/2', `execute/2', `clock_sync/3' and
-%%% `counter_interrogation/3' are declared here but wired up in phases 4 and 7.
+%%% The callback module is optional. When supplied it may implement
+%%% `interrogation/3' (override or supplement the automatic dump),
+%%% `connection_event/2', `select/2' + `execute/2' (direct execute and
+%%% select-before-operate for C_SC/C_DC/C_RC/C_SE, docs/DESIGN.md section 7)
+%%% and `clock_sync/3' (C_CS); `counter_interrogation/3' is declared here but
+%%% wired up in phase 7. A command left unimplemented (no callback module, or
+%%% the callback doesn't export `select/2' / `execute/2') is rejected with a
+%%% negative confirmation; an unimplemented `clock_sync/3' is acknowledged by
+%%% default, since accepting a clock sync has no unsafe side effect.
 -module(iec60870_server).
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
--export([start_link/1, update/2, update/3, send_asdu/3, listener_port/1]).
+-export([start_link/1, update/2, update/3, send_asdu/3, listener_port/1,
+         command_result/2]).
 
 -export_type([server_ref/0, asdu_spec/0, conn_event/0]).
 
@@ -58,10 +66,16 @@
 -callback connection_event(conn_event(), CbState :: term()) ->
     {ok, CbState :: term()}.
 
--callback select(Command :: #asdu{}, CbState :: term()) ->
+%% `select' is called for the select half (S/E = 1) of a select-before-operate
+%% sequence; the library enforces the select timeout and that the matching
+%% operate is identical to what was selected (docs/DESIGN.md section 7).
+-callback select(Command :: iec60870_command:command(), CbState :: term()) ->
     {accept, CbState :: term()} | {reject, iec60870_cot:cot(), CbState :: term()}.
 
--callback execute(Command :: #asdu{}, CbState :: term()) ->
+%% `execute' is called for a direct execute (S/E = 0 with no prior select) or
+%% the operate half of a select-before-operate sequence. `{async, Ref, _}'
+%% withholds `act_term' until {@link command_result/2} resolves `Ref'.
+-callback execute(Command :: iec60870_command:command(), CbState :: term()) ->
     {ok, CbState :: term()}
   | {ok, Info :: term(), CbState :: term()}
   | {error, iec60870_cot:cot(), CbState :: term()}
@@ -105,6 +119,19 @@ update(Server, Writes) when is_list(Writes) ->
 -spec send_asdu(server_ref(), all | {group, term()} | {coa, 0..65535}, asdu_spec()) -> ok.
 send_asdu(Server, Selector, Spec) when is_map(Spec) ->
     gen_server:cast(ctl(Server), {send_asdu, Selector, Spec}).
+
+%% @doc Resolve an `{async, Ref, _}' previously returned by the `execute/2'
+%% callback: `ok' sends a positive `act_term', `{error, Cause}' a negative
+%% one. `Ref' carries its own routing (bound to its server by
+%% `iec60870_server_ctl' when the async execute started, via
+%% {@link iec60870_registry:bind_command/2}); an unknown or already-resolved
+%% `Ref' is silently ignored.
+-spec command_result(reference(), ok | {error, iec60870_cot:cot()}) -> ok.
+command_result(Ref, Result) when is_reference(Ref) ->
+    case iec60870_registry:command_owner(Ref) of
+        undefined -> ok;
+        Ctl -> gen_server:cast(Ctl, {command_result, Ref, Result})
+    end.
 
 %% @doc The TCP port the server's listener is bound to (useful with port 0).
 -spec listener_port(server_ref()) -> inet:port_number().

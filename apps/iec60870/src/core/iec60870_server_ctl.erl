@@ -12,13 +12,16 @@
 %%%   <li>answers station / group interrogation (C_IC_NA_1) from the data
 %%%       model, batched via {@link iec60870_batch};</li>
 %%%   <li>turns {@link iec60870_server:update/3} into spontaneous ASDUs, held in
-%%%       a bounded drop-oldest buffer while no connection is active.</li>
+%%%       a bounded drop-oldest buffer while no connection is active;</li>
+%%%   <li>runs commands (C_SC/C_DC/C_RC/C_SE) — direct execute and
+%%%       select-before-operate, sync or async — and clock sync (C_CS),
+%%%       docs/DESIGN.md section 7.</li>
 %%% </ul>
 %%%
 %%% Multiple active connections all receive spontaneous and low-level traffic
-%%% (the future `redundancy => connection' semantics); interrogation is answered
-%%% on the requesting connection. Commands and clock sync are answered with a
-%%% negative confirmation until phases 4 / 7.
+%%% (the future `redundancy => connection' semantics); interrogation and
+%%% commands are answered on the requesting connection. Counter interrogation
+%%% is answered with a negative confirmation until phase 7.
 -module(iec60870_server_ctl).
 -behaviour(gen_server).
 
@@ -42,8 +45,18 @@
     conns = #{}                :: #{pid() => {active | inactive, reference()}},
     buffer = queue:new()       :: queue:queue(#asdu{}),
     buffer_len = 0             :: non_neg_integer(),
-    buffer_max = 1000          :: pos_integer()
+    buffer_max = 1000          :: pos_integer(),
+    select_timeout = 10000     :: pos_integer(),
+    clock_sync_con = true      :: boolean(),
+    %% {Coa, Ioa} -> outstanding select (docs/DESIGN.md section 7)
+    selects = #{}              :: #{{0..65535, non_neg_integer()} => select()},
+    %% async-execute reference -> what to answer with when it resolves
+    pending = #{}              :: #{reference() => pending()}
 }).
+
+-type select() :: #{cmd := iec60870_command:command(), conn := pid(),
+                    timer := reference()}.
+-type pending() :: #{asdu := #asdu{}, conn := pid()}.
 
 %%%===================================================================
 %%% API
@@ -83,7 +96,9 @@ init({Name, Config}) ->
                         listener_ref = Ref,
                         dm_mod = DmMod, dm_state = DmState,
                         cb_mod = CbMod, cb_state = CbState,
-                        buffer_max = buffer_max(Config)}};
+                        buffer_max = buffer_max(Config),
+                        select_timeout = maps:get(select_timeout, Config, 10000),
+                        clock_sync_con = maps:get(clock_sync_confirm, Config, true)}};
                 {error, Reason} ->
                     _ = DmMod:terminate(DmState),
                     {stop, {listener_failed, Reason}}
@@ -102,6 +117,8 @@ handle_cast({update, Writes}, State) ->
     {noreply, do_update(Writes, State)};
 handle_cast({send_asdu, _Selector, Spec}, State) ->
     {noreply, dispatch([spec_to_asdu(Spec)], State)};
+handle_cast({command_result, Ref, Result}, State) ->
+    {noreply, resolve_command(Ref, Result, State)};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -109,10 +126,18 @@ handle_info({iec60870, Conn, Payload}, State) ->
     handle_owner(Payload, Conn, State);
 handle_info({'DOWN', _Mon, process, Pid, _Reason}, #state{conns = Conns} = State) ->
     {noreply, State#state{conns = maps:remove(Pid, Conns)}};
+handle_info({timeout, TRef, {select_expired, Key}}, #state{selects = Selects} = State) ->
+    State1 = case Selects of
+                 #{Key := #{timer := TRef}} -> State#state{selects = maps:remove(Key, Selects)};
+                 _ -> State
+             end,
+    {noreply, State1};
 handle_info(_Msg, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{listener_ref = Ref, dm_mod = DmMod, dm_state = DmState}) ->
+terminate(_Reason, #state{listener_ref = Ref, dm_mod = DmMod, dm_state = DmState,
+                          pending = Pending}) ->
+    _ = maps:foreach(fun(Ref1, _) -> iec60870_registry:unbind_command(Ref1) end, Pending),
     _ = case Ref of
             undefined -> ok;
             _ -> iec60870_104_listener:stop(Ref)
@@ -173,10 +198,17 @@ route(#asdu{type = c_ic_na_1, cot = act} = Asdu, Conn, State) ->
 route(#asdu{type = c_ic_na_1, cot = deact} = Asdu, Conn, State) ->
     send_to(Conn, Asdu#asdu{cot = deact_con}),
     {noreply, State};
+route(#asdu{type = c_cs_na_1, cot = act} = Asdu, Conn, State) ->
+    clock_sync(Asdu, Conn, State);
 route(#asdu{cot = act} = Asdu, Conn, State) ->
-    %% commands / clock sync — not until phases 4 / 7.
-    send_to(Conn, Asdu#asdu{cot = unknown_type_id, negative = true, objects = []}),
-    {noreply, State};
+    case iec60870_command:is_command(Asdu#asdu.type) of
+        true ->
+            command(Asdu, Conn, State);
+        false ->
+            %% counter interrogation, read command, ... — not until phase 7.
+            send_to(Conn, Asdu#asdu{cot = unknown_type_id, negative = true, objects = []}),
+            {noreply, State}
+    end;
 route(_Asdu, _Conn, State) ->
     {noreply, State}.
 
@@ -249,6 +281,190 @@ call_interrogation(CbMod, Coa, Qoi, CbState) ->
             case CbMod:interrogation(Coa, Qoi, CbState) of
                 {ok, CbState1} -> {library, CbState1};
                 {ok, Specs, CbState1} when is_list(Specs) -> {explicit, Specs, CbState1}
+            end
+    end.
+
+%%%===================================================================
+%%% Commands (C_SC/C_DC/C_RC/C_SE) — docs/DESIGN.md section 7
+%%%===================================================================
+
+%% Direct execute (S/E = 0, no prior select) or select-before-operate,
+%% dispatched on the single command object's S/E bit.
+command(#asdu{coa = Coa, objects = [_]} = Asdu, Conn, #state{coas = Coas} = State) ->
+    case lists:member(Coa, Coas) of
+        false ->
+            send_to(Conn, iec60870_command:mirror(Asdu, act_con, true)),
+            {noreply, State};
+        true ->
+            Cmd = iec60870_command:to_map(Asdu),
+            case maps:get(select, Cmd) of
+                true -> do_select(Asdu, Cmd, Conn, State);
+                false -> do_execute(Asdu, Cmd, Conn, State)
+            end
+    end;
+command(_Asdu, _Conn, State) ->
+    %% malformed command — not exactly one object
+    {noreply, State}.
+
+do_select(Asdu, #{coa := Coa, ioa := Ioa} = Cmd, Conn, State) ->
+    case call_select(Cmd, State) of
+        {accept, State1} ->
+            send_to(Conn, iec60870_command:mirror(Asdu, act_con, false)),
+            Selects = start_select(Coa, Ioa, Cmd, Conn, State1),
+            {noreply, State1#state{selects = Selects}};
+        {reject, Cot, State1} ->
+            send_to(Conn, iec60870_command:mirror(Asdu, neg_cot(Cot), true)),
+            {noreply, State1}
+    end.
+
+%% No callback module, or one that doesn't opt into `select/2': commands are
+%% refused by default rather than silently accepted.
+call_select(_Cmd, #state{cb_mod = undefined} = State) ->
+    {reject, act_con, State};
+call_select(Cmd, #state{cb_mod = CbMod, cb_state = CbState} = State) ->
+    case erlang:function_exported(CbMod, select, 2) of
+        false ->
+            {reject, act_con, State};
+        true ->
+            case CbMod:select(Cmd, CbState) of
+                {accept, CbState1} -> {accept, State#state{cb_state = CbState1}};
+                {reject, Cot, CbState1} -> {reject, Cot, State#state{cb_state = CbState1}}
+            end
+    end.
+
+start_select(Coa, Ioa, Cmd, Conn, #state{selects = Selects, select_timeout = Timeout}) ->
+    Key = {Coa, Ioa},
+    _ = case Selects of
+            #{Key := #{timer := Old}} -> erlang:cancel_timer(Old);
+            _ -> ok
+        end,
+    TRef = erlang:start_timer(Timeout, self(), {select_expired, Key}),
+    Selects#{Key => #{cmd => Cmd, conn => Conn, timer => TRef}}.
+
+do_execute(Asdu, #{coa := Coa, ioa := Ioa} = Cmd, Conn, #state{selects = Selects} = State) ->
+    case take_select(Coa, Ioa, Cmd, Selects) of
+        {ok, Selects1} ->
+            run_execute(Asdu, Cmd, Conn, State#state{selects = Selects1});
+        none ->
+            run_execute(Asdu, Cmd, Conn, State);
+        mismatch ->
+            %% an outstanding select exists but this operate doesn't match it
+            %% — reject and leave the select armed for a correct retry.
+            send_to(Conn, iec60870_command:mirror(Asdu, act_con, true)),
+            {noreply, State}
+    end.
+
+take_select(Coa, Ioa, Cmd, Selects) ->
+    Key = {Coa, Ioa},
+    case Selects of
+        #{Key := #{cmd := SelCmd, timer := TRef}} ->
+            case iec60870_command:matches(SelCmd, Cmd) of
+                true ->
+                    _ = erlang:cancel_timer(TRef),
+                    {ok, maps:remove(Key, Selects)};
+                false ->
+                    mismatch
+            end;
+        _ ->
+            none
+    end.
+
+run_execute(Asdu, Cmd, Conn, State) ->
+    case call_execute(Cmd, State) of
+        {error, Cot, State1} ->
+            send_to(Conn, iec60870_command:mirror(Asdu, neg_cot(Cot), true)),
+            {noreply, State1};
+        {ok, State1} ->
+            send_to(Conn, iec60870_command:mirror(Asdu, act_con, false)),
+            send_to(Conn, iec60870_command:mirror(Asdu, act_term, false)),
+            {noreply, State1};
+        {async, Ref, #state{pending = Pending} = State1} ->
+            send_to(Conn, iec60870_command:mirror(Asdu, act_con, false)),
+            ok = iec60870_registry:bind_command(Ref, self()),
+            Pending1 = Pending#{Ref => #{asdu => Asdu, conn => Conn}},
+            {noreply, State1#state{pending = Pending1}}
+    end.
+
+%% No callback module, or one that doesn't opt into `execute/2': commands are
+%% refused by default rather than silently accepted.
+call_execute(_Cmd, #state{cb_mod = undefined} = State) ->
+    {error, act_con, State};
+call_execute(Cmd, #state{cb_mod = CbMod, cb_state = CbState} = State) ->
+    case erlang:function_exported(CbMod, execute, 2) of
+        false ->
+            {error, act_con, State};
+        true ->
+            case CbMod:execute(Cmd, CbState) of
+                {ok, CbState1} -> {ok, State#state{cb_state = CbState1}};
+                %% return-information (COT 11/12) from `Info' is deferred —
+                %% treated the same as a plain `{ok, _}' for now.
+                {ok, _Info, CbState1} -> {ok, State#state{cb_state = CbState1}};
+                {error, Cot, CbState1} -> {error, Cot, State#state{cb_state = CbState1}};
+                {async, Ref, CbState1} -> {async, Ref, State#state{cb_state = CbState1}}
+            end
+    end.
+
+%% `{command_result, Ref, Result}' cast — resolves an `{async, Ref, _}' left
+%% pending by `execute/2'. An unknown or already-resolved `Ref' is ignored.
+resolve_command(Ref, Result, #state{pending = Pending} = State) ->
+    case maps:take(Ref, Pending) of
+        {#{asdu := Asdu, conn := Conn}, Pending1} ->
+            _ = iec60870_registry:unbind_command(Ref),
+            send_to(Conn, iec60870_command:mirror(Asdu, act_term, Result =/= ok)),
+            State#state{pending = Pending1};
+        error ->
+            State
+    end.
+
+%% A rejection/error `Cot' the callback supplied must be a valid COT; fall
+%% back to a plain `act_con' rather than let a misbehaving callback crash the
+%% connection on encode.
+neg_cot(Cot) ->
+    try iec60870_cot:to_int(Cot) of
+        _ -> Cot
+    catch
+        error:_ -> act_con
+    end.
+
+%%%===================================================================
+%%% Clock sync (C_CS_NA_1) — docs/DESIGN.md section 7
+%%%===================================================================
+
+clock_sync(#asdu{coa = Coa, objects = [#object{timestamp = Time}]} = Asdu, Conn,
+           #state{coas = Coas} = State) ->
+    case lists:member(Coa, Coas) of
+        false ->
+            send_to(Conn, iec60870_command:mirror(Asdu, act_con, true)),
+            {noreply, State};
+        true ->
+            case call_clock_sync(Coa, Time, State) of
+                {ok, State1} ->
+                    case State1#state.clock_sync_con of
+                        true -> send_to(Conn, iec60870_command:mirror(Asdu, act_con, false));
+                        false -> ok
+                    end,
+                    {noreply, State1};
+                {error, Cot, State1} ->
+                    send_to(Conn, iec60870_command:mirror(Asdu, neg_cot(Cot), true)),
+                    {noreply, State1}
+            end
+    end;
+clock_sync(_Asdu, _Conn, State) ->
+    %% malformed C_CS — no time object
+    {noreply, State}.
+
+%% No callback / no `clock_sync/3': accepted by default — unlike a command,
+%% acknowledging a clock sync has no unsafe side effect.
+call_clock_sync(_Coa, _Time, #state{cb_mod = undefined} = State) ->
+    {ok, State};
+call_clock_sync(Coa, Time, #state{cb_mod = CbMod, cb_state = CbState} = State) ->
+    case erlang:function_exported(CbMod, clock_sync, 3) of
+        false ->
+            {ok, State};
+        true ->
+            case CbMod:clock_sync(Coa, Time, CbState) of
+                {ok, CbState1} -> {ok, State#state{cb_state = CbState1}};
+                {error, Cot, CbState1} -> {error, Cot, State#state{cb_state = CbState1}}
             end
     end.
 

@@ -1,9 +1,9 @@
 # IEC 60870 Erlang Library — Design
 
-Status: phases 0–3 implemented (skeleton + ASDU codec + APCI / single-connection
-state machine + default data model / interrogation / spontaneous path); phase 4
-(commands) is next. Authoritative copy; the published artifact is a rendered
-snapshot.
+Status: phases 0–4 implemented (skeleton + ASDU codec + APCI / single-connection
+state machine + default data model / interrogation / spontaneous path +
+commands / select-before-operate / clock sync); phase 5 (redundancy) is next.
+Authoritative copy; the published artifact is a rendered snapshot.
 
 ## 1. Scope
 
@@ -43,9 +43,11 @@ apps/iec60870/
       iec60870_server.erl        user-facing server API + behaviour definition
       iec60870_server_sup.erl
       iec60870_server_ctl.erl    gen_server: config, callback state, command router
+      iec60870_command.erl       command decode/match/mirror (pure)
       iec60870_rgroup_sup.erl
       iec60870_rgroup.erl        gen_statem: active-conn arbitration + event buffer
-      iec60870_registry.erl      gen_server: instance name -> pid (also {via,_,_})
+      iec60870_registry.erl      gen_server: instance name -> pid (also {via,_,_});
+                                 also binds async-command refs to their server
       iec60870_instances_sup.erl DynamicSupervisor for library-managed instances
       iec60870_data_model.erl    behaviour
       iec60870_dm_ets.erl        default ETS-backed data model
@@ -245,27 +247,29 @@ Two conceptually separate stores — do not conflate:
 | current values | per common address, shared across the server | answer interrogation; suppress no-change spontaneous events |
 | event queue | per redundancy group (§5) | spontaneous transmission + switchover replay |
 
-## 7. Commands
+## 7. Commands (done)
 
 The library runs **all protocol mechanics**; the callback module performs **only
-the semantic action** and may answer asynchronously.
+the semantic action** and may answer asynchronously. Implemented in
+`iec60870_server_ctl` (`command/3`, `clock_sync/3` and helpers); the pure
+decode/match/mirror pieces live in `iec60870_command`.
 
 ### Callback behaviour (`iec60870_server` behaviour)
 
 ```erlang
 -callback init(Args) -> {ok, CbState}.
 
--callback select(command(), CbState) ->
-      {accept, CbState} | {reject, cause(), CbState}.
+-callback select(iec60870_command:command(), CbState) ->
+      {accept, CbState} | {reject, iec60870_cot:cot(), CbState}.
 
--callback execute(command(), CbState) ->
+-callback execute(iec60870_command:command(), CbState) ->
       {ok, CbState}
     | {ok, term_info(), CbState}
-    | {error, cause(), CbState}
-    | {async, ref(), CbState}.          %% later: iec60870_server:command_result(Ref, Result)
+    | {error, iec60870_cot:cot(), CbState}
+    | {async, ref(), CbState}.          %% resolved by iec60870_server:command_result(Ref, Result)
 
 -callback clock_sync(Coa, cp56(), CbState) ->
-      {ok, CbState} | {error, cause(), CbState}.
+      {ok, CbState} | {error, iec60870_cot:cot(), CbState}.
 
 -callback interrogation(Coa, qoi(), CbState) ->
       {ok, CbState}                     %% let the data model answer it (default)
@@ -277,6 +281,18 @@ the semantic action** and may answer asynchronously.
       %% event() :: {up | down, peer()} | {activated | deactivated, group()}
 ```
 
+`command()` is the decoded command map (maps at the public API, decision 5):
+`#{type, coa, ioa, value, select, qualifier, orig_addr, test}` — `select`
+mirrors the S/E bit, `qualifier` the rest (`#{select, qu}` for single / double
+/ regulating step, `#{select, ql}` for the three setpoints). A `select` /
+`execute` rejection's `Cot` is sent as the negative confirmation's cause of
+transmission (typically `act_con`, or one of `unknown_type_id` /
+`unknown_cot` / `unknown_coa` / `unknown_ioa`); an invalid `Cot` falls back to
+`act_con` rather than crash the connection. No callback module, or one that
+doesn't export `select/2` / `execute/2`, rejects every command — accepting by
+default would be unsafe. A missing `clock_sync/3` instead **accepts** by
+default, since acknowledging a clock sync has no unsafe side effect.
+
 ### Interrogation (C_IC_NA_1) — library-driven
 
 1. recv `act` (COT 6) → validate COA / QOI
@@ -285,23 +301,37 @@ the semantic action** and may answer asynchronously.
    `interrogated_station` (20) or `interrogated_group_n` (21–36), batched into ASDUs
 4. send `act_term` (COT 10)
 
-### Single / Double command (C_SC_NA_1 / C_DC_NA_1)
+### Commands (C_SC/C_DC/C_RC/C_SE_NA/NB/NC_1)
 
-- **Direct execute:** recv `act` → `execute/2` → `act_con` (7, P/N per result) →
-  `act_term` (10). Persistent commands also produce return information (COT 11/12)
-  from the data model.
-- **Select-before-operate:** recv select (S/E = 1, `act`) → `select/2` → select
-  `act_con` → recv execute (S/E = 0, `act`) → execute `act_con` → `execute/2` →
-  `act_term`. Library enforces the select timeout and that execute matches the
-  selected object.
-- `{async, Ref, _}` ⇒ library holds `act_term` until
-  `iec60870_server:command_result(Ref, ok | {error, Cause})`. The connection
-  process never blocks.
+- **Direct execute:** recv `act` (no prior select for that `{Coa, Ioa}`) →
+  `execute/2` → `act_con` (7, P/N per result) → `act_term` (10) on success; a
+  negative `act_con` sends no `act_term`.
+- **Select-before-operate:** recv select (S/E = 1, `act`) → `select/2` →
+  select `act_con` (positive starts the select timer, config key
+  `select_timeout`, default 10 s) → recv operate (S/E = 0, `act`) → if it is
+  identical to the selected object (`iec60870_command:matches/2` — same
+  type/COA/IOA/value/qualifier, S/E bit disregarded) consume the select and
+  run it as a direct execute; a mismatched operate is rejected (negative
+  `act_con`) and the select stays armed for a correct retry; an operate that
+  arrives after the timeout, with no matching select left, runs as a direct
+  execute.
+- `{async, Ref, _}` ⇒ positive `act_con` immediately, `act_term` withheld
+  until `iec60870_server:command_result(Ref, ok | {error, Cot})` — `Ref` is
+  bound to its server in `iec60870_registry` (`bind_command/2` /
+  `command_owner/1` / `unbind_command/1`) so the 2-arity call can route
+  without carrying a server reference; an unknown/already-resolved `Ref` is
+  ignored. The connection process never blocks.
+- `{ok, term_info(), CbState}`'s return information (COT 11/12 from the data
+  model, for persistent commands) is accepted but not yet wired to the data
+  model — treated the same as a plain `{ok, CbState}` for now.
 
 ### Clock sync (C_CS_NA_1)
 
-recv → `clock_sync/3` → `act_con`. The kept clock offset feeds timestamping of
-subsequently generated events. Config option for masters that expect no `act_con`.
+recv → `clock_sync/3` → `act_con` (config key `clock_sync_confirm`, default
+`true`, for masters that expect none — a rejection is still always sent).
+Feeding the kept clock offset into the timestamping of subsequently generated
+events is **not yet implemented** — a later phase threads it through
+`iec60870_point:to_object/3`; today the callback only observes the time.
 
 ## 8. Sending information objects
 
@@ -355,6 +385,8 @@ ASDUs by hand.
     redundancy => #{mode => single, buffer => 5000},
     data_model => {iec60870_dm_ets, #{points => "priv/points.eterm"}},
     callback   => {my_rtu_app, #{}},
+    select_timeout     => 10000,   %% ms; select-before-operate (section 7)
+    clock_sync_confirm => true,    %% send act_con for C_CS_NA_1 (section 7)
     params     => #{k => 12, w => 8, t1 => 15000, t2 => 10000, t3 => 20000,
                     max_asdu => 249, coa_size => 2, ioa_size => 3, cot_size => 2,
                     orig_addr => enabled}
@@ -431,7 +463,15 @@ port convention 19998. Delivered through `ranch_ssl` — mostly pass-through of 
    active buffer). eunit for batch / point / dm_ets; `common_test`
    (`iec60870_server_SUITE`) drives interrogation and the spontaneous path over
    a raw client socket.
-4. Commands: single / double / setpoint, direct + SBO, clock sync, async execute.
+4. **Commands (done):** `iec60870_command` (pure decode/match/mirror);
+   `iec60870_server_ctl` runs direct execute and select-before-operate for
+   C_SC/C_DC/C_RC/C_SE_NA/NB/NC_1 (select timeout, execute-matches-select),
+   async execute via `{async, Ref}` + `iec60870_server:command_result/2`
+   (`Ref` routed through a small binding in `iec60870_registry`), and clock
+   sync (C_CS_NA_1, with a no-`act_con` config option — the offset-into-
+   event-timestamps part is deferred). eunit for the pure helpers
+   (`iec60870_command_tests`); `iec60870_server_SUITE` drives direct/SBO/
+   async commands and clock sync over a raw client socket.
 5. Redundancy: `iec60870_rgroup`, all three modes, event buffer, switchover replay; multi-socket `common_test`.
 6. TLS transport + 62351-3 defaults.
 7. Counter interrogation, end-of-init, test command, background scan, read command, parameter of measured value.

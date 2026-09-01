@@ -5,14 +5,22 @@
 %%% (`register_name/2', `unregister_name/1', `whereis_name/1', `send/2') so an
 %%% instance can be addressed with a standard OTP name spec.
 %%%
+%%% Also binds async-command references to their owning `iec60870_server_ctl'
+%%% (docs/DESIGN.md section 7), under the tagged key `{command, Ref}' so it
+%%% cannot collide with an instance name — `iec60870_server:command_result/2'
+%%% is handed only a `reference()' and needs to find the right server.
+%%%
 %%% Lookups read the ETS table directly and take no lock. Registration and
 %%% deregistration are serialised through the owning `gen_server', which also
-%%% monitors registered pids and drops their entries when they die.
+%%% monitors registered pids and drops their entries when they die (a crashed
+%%% `server_ctl' drops its command bindings the same way a crashed instance
+%%% supervisor drops its name).
 -module(iec60870_registry).
 -behaviour(gen_server).
 
 -export([start_link/0]).
 -export([register_name/2, unregister_name/1, whereis_name/1, send/2, names/0]).
+-export([bind_command/2, command_owner/1, unbind_command/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
@@ -57,6 +65,28 @@ send(Name, Msg) ->
 names() ->
     ets:tab2list(?TAB).
 
+%% @doc Bind an async-command reference to the `server_ctl' pid that issued
+%% it, for {@link command_owner/1} to find later.
+-spec bind_command(reference(), pid()) -> ok.
+bind_command(Ref, Pid) when is_reference(Ref), is_pid(Pid) ->
+    gen_server:call(?MODULE, {bind_command, Ref, Pid}).
+
+%% @doc The `server_ctl' pid a command reference was bound to, or `undefined'
+%% (never bound, already resolved, or its server is gone).
+-spec command_owner(reference()) -> pid() | undefined.
+command_owner(Ref) when is_reference(Ref) ->
+    try ets:lookup(?TAB, {command, Ref}) of
+        [{_, Pid}] -> Pid;
+        [] -> undefined
+    catch
+        error:badarg -> undefined
+    end.
+
+%% @doc Drop a command-reference binding once it is resolved.
+-spec unbind_command(reference()) -> ok.
+unbind_command(Ref) when is_reference(Ref) ->
+    gen_server:call(?MODULE, {unbind_command, Ref}).
+
 %%% gen_server
 
 -spec init([]) -> {ok, #state{}}.
@@ -75,6 +105,13 @@ handle_call({register, Name, Pid}, _From, State) ->
     end;
 handle_call({unregister, Name}, _From, State) ->
     _ = ets:delete(?TAB, Name),
+    {reply, ok, State};
+handle_call({bind_command, Ref, Pid}, _From, State) ->
+    _ = monitor(process, Pid),
+    true = ets:insert(?TAB, {{command, Ref}, Pid}),
+    {reply, ok, State};
+handle_call({unbind_command, Ref}, _From, State) ->
+    _ = ets:delete(?TAB, {command, Ref}),
     {reply, ok, State};
 handle_call(_Request, _From, State) ->
     {reply, {error, badarg}, State}.
