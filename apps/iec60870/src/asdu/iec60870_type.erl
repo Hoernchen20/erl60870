@@ -30,7 +30,7 @@
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
--export([id_to_name/1, name_to_id/1]).
+-export([id_to_name/1, name_to_id/1, payload_size/1]).
 -export([encode_payload/2, decode_payload/3]).
 
 %%%===================================================================
@@ -92,6 +92,36 @@ id_to_name(102) -> c_rd_na_1;
 id_to_name(103) -> c_cs_na_1;
 id_to_name(107) -> c_ts_ta_1;
 id_to_name(N) when is_integer(N), N >= 0, N =< 255 -> N.
+
+%% @doc Fixed octet length of one information element's payload (everything
+%% after its information object address). Every v1 type has a constant width;
+%% used by {@link iec60870_batch} to size ASDUs.
+-spec payload_size(iec60870_asdu:type_name()) -> non_neg_integer().
+payload_size(m_sp_na_1) -> 1;
+payload_size(m_dp_na_1) -> 1;
+payload_size(m_st_na_1) -> 2;
+payload_size(m_me_na_1) -> 3;
+payload_size(m_me_nb_1) -> 3;
+payload_size(m_me_nc_1) -> 5;
+payload_size(m_it_na_1) -> 5;
+payload_size(m_sp_tb_1) -> 8;
+payload_size(m_dp_tb_1) -> 8;
+payload_size(m_me_td_1) -> 10;
+payload_size(m_me_te_1) -> 10;
+payload_size(m_me_tf_1) -> 12;
+payload_size(m_it_tb_1) -> 12;
+payload_size(m_ei_na_1) -> 1;
+payload_size(c_sc_na_1) -> 1;
+payload_size(c_dc_na_1) -> 1;
+payload_size(c_rc_na_1) -> 1;
+payload_size(c_se_na_1) -> 3;
+payload_size(c_se_nb_1) -> 3;
+payload_size(c_se_nc_1) -> 5;
+payload_size(c_ic_na_1) -> 1;
+payload_size(c_ci_na_1) -> 1;
+payload_size(c_rd_na_1) -> 0;
+payload_size(c_cs_na_1) -> 7;
+payload_size(c_ts_ta_1) -> 9.
 
 %%%===================================================================
 %%% Payload encode

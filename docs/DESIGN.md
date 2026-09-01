@@ -1,8 +1,9 @@
 # IEC 60870 Erlang Library — Design
 
-Status: phases 0–2 implemented (skeleton + ASDU codec + APCI / single-connection
-state machine); phase 3 (default data model + interrogation + spontaneous path)
-is next. Authoritative copy; the published artifact is a rendered snapshot.
+Status: phases 0–3 implemented (skeleton + ASDU codec + APCI / single-connection
+state machine + default data model / interrogation / spontaneous path); phase 4
+(commands) is next. Authoritative copy; the published artifact is a rendered
+snapshot.
 
 ## 1. Scope
 
@@ -81,6 +82,13 @@ iec60870_sup                     one_for_one, app root
 `rest_for_one`, children ordered as listed: if `server_ctl` or the data model
 dies, everything to its right (groups, connections, listener) restarts; a single
 connection crash is isolated by `conn_sup`.
+
+**Phase-3 interim.** Only `iec60870_server_ctl` exists as a child so far. It is
+also the connection owner (section 4) and, until the redundancy layer lands in
+phase 5, it starts the `ranch` listener itself (`owner => self()`) and hosts the
+default data model's `public` ETS table (`iec60870_dm_ets:init/1` runs in this
+process). `rgroup_sup`, `conn_sup` and a standalone data-model process arrive
+with phase 5; point values do not survive a `server_ctl` restart yet.
 
 ## 4. APCI / connection state machine
 
@@ -197,6 +205,9 @@ Pluggable via the `iec60870_data_model` behaviour; the library ships
 `iec60870_dm_ets` and uses it by default.
 
 ```erlang
+%% init/terminate are plain behaviour callbacks — an implementation need not be
+%% a process. iec60870_dm_ets keeps a `public` ETS table owned by whoever calls
+%% init/1 (iec60870_server_ctl).
 -callback init(Args :: term()) -> {ok, State}.
 -callback terminate(State) -> ok.
 
@@ -204,17 +215,28 @@ Pluggable via the `iec60870_data_model` behaviour; the library ships
 -callback read(State, Coa, Ioa) -> {ok, point()} | not_found.
 -callback write(State, Coa, Ioa, point()) -> {ok, State, changed :: boolean()}.
 
-%% interrogation: fold the points that belong to (Coa, InterrogationGroup)
--callback fold(State, Coa, ig() | station, fun((point(), Acc) -> Acc), Acc) -> Acc.
+%% interrogation: fold the interrogable points of (Coa, InterrogationGroup);
+%% `station` visits every one, `1..16` only that group's. The fold function
+%% sees each point's IOA (a point() does not carry its own address).
+-callback fold(State, Coa, ig() | station,
+               fun((Ioa, point(), Acc) -> Acc), Acc) -> Acc.
 -callback coas(State) -> [Coa].
 
-%% counters (for counter interrogation), optional
+%% counters (for counter interrogation) — phase 7
 -callback read_counter(State, Coa, Ioa) -> {ok, counter()} | not_found.
 -callback freeze_counters(State, Coa, qcc()) -> {ok, State}.
 ```
 
-`point()` carries: type id, value, quality descriptor, timestamp,
-interrogation-group assignment, and cyclic/background flags.
+`point()` is a map: `#{type := type_name(), value := term(),
+quality := [quality_flag()], ts := ms_since_epoch | undefined,
+group := 1..16 | undefined, qualifier => term()}` — see `iec60870_point`.
+Integrated totals (`m_it_*`) are stored but not `interrogable`; cyclic /
+background scan flags are deferred to phase 7.
+
+`iec60870_data_model:is_significant_change/2` is the shared no-change policy: a
+new IOA always counts; otherwise `write` reports `changed` only when the value
+or the (order-independent) quality list differs. A bare timestamp refresh does
+not count.
 
 Two conceptually separate stores — do not conflate:
 
@@ -287,20 +309,26 @@ subsequently generated events. Config option for masters that expect no `act_con
 
 ```erlang
 iec60870_server:update(Server, {Coa, Ioa}, #{
-    type  => m_me_nc_1,
-    value => 3.14,
-    qds   => [],   %% [] | [invalid, not_topical, blocked, substituted, overflow]
-    ts    => erlang:system_time(millisecond)   %% omit for the "no timestamp" variant
+    type    => m_me_nc_1,
+    value   => 3.14,
+    quality => [],   %% [] | [invalid, not_topical, blocked, substituted, overflow]
+    ts      => erlang:system_time(millisecond)  %% omit for the "no timestamp" variant
 }).
 ```
 
-The library writes the current-value store and, **iff changed**, builds a
-spontaneous ASDU (COT 3) and enqueues it into every redundancy group's buffer. On
-flush it batches objects of equal `{type, COA, COT}` into single ASDUs (≤ 249
-octets; SQ=0, or SQ=1 sequence for contiguous IOAs), then hands them to each
-active connection subject to its `k` window and t1.
+The library writes the current-value store and, **iff changed** (§6 —
+value or quality differs), builds a spontaneous ASDU (COT 3) and enqueues it
+into every redundancy group's buffer. On flush it batches objects of equal
+`{type, COA, COT}` into single ASDUs (≤ 249 octets; SQ=0, or SQ=1 sequence for
+contiguous IOAs — `iec60870_batch`), then hands them to each active connection
+subject to its `k` window and t1.
 
 Bulk form: `iec60870_server:update(Server, [{{Coa, Ioa}, Spec}, ...])`.
+
+**Phase-3 interim.** There is no per-group buffer yet: `server_ctl` sends batched
+ASDUs to every active connection immediately, and holds them in one bounded
+drop-oldest queue (`redundancy.buffer`, default 1000) only while *no* connection
+is active, flushing it on the next STARTDT.
 
 ### Low level (escape hatch)
 
@@ -391,7 +419,18 @@ port convention 19998. Delivered through `ranch_ssl` — mostly pass-through of 
    spec byte-vectors + `proper` (frame round-trip, sequence arithmetic);
    `common_test` drives the state machine over raw client sockets. Owner seam:
    a per-listener pid (see §4).
-3. `iec60870_dm_ets` + interrogation + `update/3` spontaneous path + batching.
+3. **Data model + interrogation + spontaneous path (done):**
+   `iec60870_data_model` behaviour + shared no-change policy; `iec60870_dm_ets`
+   default (`public` ETS, `{COA,IOA}` -> point map, preload); `iec60870_point`
+   (point map <-> `#object{}`); `iec60870_batch` (pack objects into ≤ 249-octet
+   ASDUs, SQ=1 for contiguous runs); the server backbone —
+   `iec60870:start_server/2`, `iec60870_server` (API + callback behaviour),
+   `iec60870_server_sup`, `iec60870_server_ctl` (the connection owner: runs the
+   `ranch` listener, answers station / group interrogation from the data model,
+   turns `update/3` into batched spontaneous ASDUs with a bounded hold-until-
+   active buffer). eunit for batch / point / dm_ets; `common_test`
+   (`iec60870_server_SUITE`) drives interrogation and the spontaneous path over
+   a raw client socket.
 4. Commands: single / double / setpoint, direct + SBO, clock sync, async execute.
 5. Redundancy: `iec60870_rgroup`, all three modes, event buffer, switchover replay; multi-socket `common_test`.
 6. TLS transport + 62351-3 defaults.

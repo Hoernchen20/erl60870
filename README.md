@@ -3,18 +3,20 @@
 An Erlang/OTP library for the IEC 60870-5 telecontrol protocol family.
 
 **Status:** early development. The design is settled — see
-[docs/DESIGN.md](docs/DESIGN.md) — and implementation proceeds in phases.
-Nothing here is usable yet.
+[docs/DESIGN.md](docs/DESIGN.md) — and implementation proceeds in phases. A
+104 server that answers station / group interrogation and sends spontaneous
+data from a pluggable data model works today; commands, redundancy and TLS are
+still to come.
 
 ## Roadmap
 
 | Phase | Deliverable |
 |------:|-------------|
-| **0** | Project skeleton, CI, ASDU record header — *current* |
+| 0 | Project skeleton, CI, ASDU record header |
 | 1 | ASDU wire codec (all v1 type ids) |
 | 2 | IEC 60870-5-104 APCI + single-connection state machine |
 | 3 | Default ETS data model, interrogation, spontaneous transmission |
-| 4 | Commands: single / double / setpoint, direct + select-before-operate, clock sync |
+| **4** | Commands: single / double / setpoint, direct + select-before-operate, clock sync — *next* |
 | 5 | Redundancy groups + switchover replay |
 | 6 | TLS transport (IEC 62351-3) |
 | 7 | Counter interrogation, remaining system functions |
