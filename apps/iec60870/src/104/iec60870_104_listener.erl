@@ -8,6 +8,12 @@
 %%% iec60870_104_conn} resolves per socket after the handshake — that is how
 %%% phase 5 assigns each connection to its redundancy group by peer address.
 %%% `child_spec/2' is provided so a server subtree can supervise the listener.
+%%%
+%%% `transport => tls' runs over `ranch_ssl'; its `transport_opts' are filled
+%%% in with the IEC 62351-3 defaults by {@link iec60870_tls:server_opts/1}
+%%% before being handed to `ranch' (docs/DESIGN.md section 11). No further
+%%% change is needed here or in {@link iec60870_104_conn} — `ranch_ssl'
+%%% implements the same `ranch_transport' behaviour as `ranch_tcp'.
 -module(iec60870_104_listener).
 
 -export([start/2, stop/1, port/1, child_spec/2]).
@@ -44,11 +50,12 @@ child_spec(Name, Opts) ->
     ranch:child_spec(Name, Transport, RanchOpts, iec60870_104_conn, ProtoOpts).
 
 translate(#{owner := Owner} = Opts) when is_pid(Owner); is_function(Owner, 1) ->
-    Transport = case maps:get(transport, Opts, tcp) of
-                    tcp -> ranch_tcp;
-                    tls -> ranch_ssl;
-                    Mod when is_atom(Mod) -> Mod
-                end,
-    RanchOpts = #{socket_opts => maps:get(transport_opts, Opts, [])},
+    RawTOpts = maps:get(transport_opts, Opts, []),
+    {Transport, TOpts} = case maps:get(transport, Opts, tcp) of
+                             tcp -> {ranch_tcp, RawTOpts};
+                             tls -> {ranch_ssl, iec60870_tls:server_opts(RawTOpts)};
+                             Mod when is_atom(Mod) -> {Mod, RawTOpts}
+                         end,
+    RanchOpts = #{socket_opts => TOpts},
     ProtoOpts = #{owner => Owner, params => maps:get(params, Opts, #{})},
     {Transport, RanchOpts, ProtoOpts}.

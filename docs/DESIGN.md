@@ -1,9 +1,11 @@
 # IEC 60870 Erlang Library — Design
 
-Status: phases 0–4 implemented (skeleton + ASDU codec + APCI / single-connection
+Status: phases 0–6 implemented (skeleton + ASDU codec + APCI / single-connection
 state machine + default data model / interrogation / spontaneous path +
-commands / select-before-operate / clock sync); phase 5 (redundancy) is next.
-Authoritative copy; the published artifact is a rendered snapshot.
+commands / select-before-operate / clock sync + redundancy groups / switchover
+replay + TLS transport / 62351-3 defaults); phase 7 (counter interrogation,
+end-of-init, ...) is next. Authoritative copy; the published artifact is a
+rendered snapshot.
 
 ## 1. Scope
 
@@ -36,6 +38,8 @@ apps/iec60870/
                                 (also the ranch_protocol callback)
       iec60870_104_listener.erl ranch:start_listener wrapper; redundancy-group
                                 assignment added in phase 5
+      iec60870_tls.erl          IEC 62351-3 default merging for {tls, _} transport
+                                config (phase 6, section 11)
     101/                        (phase 3)
       iec60870_101_link.erl
     core/
@@ -442,13 +446,44 @@ returns the per-server supervisor for embedding in a user tree;
 
 CP56Time2a only for timestamped variants; CP24Time2a / CP16Time2a not in v1.
 
-## 11. TLS (IEC 62351-3)
+## 11. TLS (IEC 62351-3) — done
 
-`transport => {tls, SslOpts}`. Defaults: `versions [tlsv1.2, tlsv1.3]`,
-`verify_peer`, `fail_if_no_peer_cert true` (mutual auth is the field norm),
-explicit `ciphers`, optional CRL / peer-cert allowlist via `verify_fun`. Secure
-port convention 19998. Delivered through `ranch_ssl` — mostly pass-through of OTP
-`ssl` options with strict defaults and a `verify_none` opt-out for lab use.
+`transport => {tls, SslOpts}`; `iec60870_104_listener:translate/1` routes
+`SslOpts` through `iec60870_tls:server_opts/1` before handing them to
+`ranch_ssl` as `socket_opts` — a pure function, no new process. For every key
+the caller hasn't already set it fills in:
+
+| Option | Default | |
+|---|---|---|
+| `versions` | `['tlsv1.2', 'tlsv1.3']` | |
+| `verify` | `verify_peer` | mutual auth is the 62351-3 norm |
+| `fail_if_no_peer_cert` | `true` | only added when `verify` resolves to `verify_peer` (see below) |
+| `ciphers` | AEAD + forward-secret only: the TLS 1.3 suites plus ECDHE-\*-GCM/CHACHA20 for 1.2 | one list; `ssl` matches each name against whichever version is negotiated |
+| `port` | `19998` | the IEC 62351-3 secure-104 convention |
+
+Caller options always win, including `verify_fun` (CRL checking or a
+peer-cert allowlist — plain OTP `ssl` pass-through, not implemented by this
+library) and certificates (`cert(file)` / `key(file)` / `cacerts(file)`,
+always the caller's — there is no library default for those, so a `tls`
+listener with none set fails to start). Passing `{verify, verify_none}`
+explicitly opts out of mutual auth for lab use: the `fail_if_no_peer_cert`
+default is then skipped rather than forced back on top of it.
+
+`iec60870_104_conn` needed no change: `ranch_ssl` implements the same
+`ranch_transport` behaviour as `ranch_tcp` (`send/2`, `setopts/2`,
+`peername/1`, `close/1`, and a 4-tuple `messages/0` already handled by
+`msg_tags/1`), so the APCI state machine, k/w window and timers are identical
+over TLS. A handshake failure surfaces as `ranch:handshake/1` returning
+`{error, _}` inside `iec60870_104_conn:init/1`, crashing that one connection
+process before it ever reaches `gen_statem:enter_loop` — same failure shape as
+any other pre-loop init error, isolated by ranch's per-connection supervision.
+
+Note for TLS 1.3 test/client code: the server sends its whole first flight
+(through its own `Finished`) before it ever sees the client's `Certificate`,
+so a client whose `ssl:connect/4` returns `{ok, _}` can still be rejected
+moments later by a `fail_if_no_peer_cert` server closing post-handshake —
+don't treat a successful client-side `connect` as proof the server accepted
+the peer certificate.
 
 ## 12. Decisions
 
@@ -513,7 +548,19 @@ port convention 19998. Delivered through `ranch_ssl` — mostly pass-through of 
    a connection state; the standalone data-model / supervised-listener nodes
    stay deferred. eunit `iec60870_rgroup_tests` (peer-address matcher);
    multi-socket `iec60870_rgroup_SUITE` (all three modes + switchover replay).
-6. TLS transport + 62351-3 defaults.
+6. **TLS transport + 62351-3 defaults (done):** `iec60870_tls:server_opts/1`
+   (pure default-merging over the caller's `ssl` options — TLS 1.2/1.3 only,
+   mutual auth, a forward-secret AEAD `ciphers` list, the 19998 secure-port
+   convention, a `verify_none` lab opt-out); `iec60870_104_listener` routes
+   `{tls, _}` transport config through it before calling `ranch_ssl`.
+   `iec60870_104_conn` unchanged — `ranch_ssl` already speaks the same
+   `ranch_transport` behaviour. eunit `iec60870_tls_tests` (default merging,
+   pure); `iec60870_104_tls_SUITE` drives STARTDT + an ASDU over a real
+   `ranch_ssl` listener against an `ssl` client, using self-signed
+   certificates from `public_key:pkix_test_data/1` (generated per test run,
+   nothing committed to the repo) — mutual-auth success, a certless client
+   rejected by the default, the `verify_none` opt-out accepting one, and a
+   cipher outside the default list failing to negotiate.
 7. Counter interrogation, end-of-init, test command, background scan, read command, parameter of measured value.
 8. Docs, `examples/`, interop test vs `lib60870` / a real master.
 
