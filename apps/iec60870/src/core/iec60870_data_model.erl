@@ -10,17 +10,22 @@
 %%% {@link iec60870_dm_ets} keeps a `public' ETS table owned by whoever calls
 %%% `init/1'). `iec60870_server_ctl' is the sole caller and serialises them.
 %%%
-%%% Counter support (`read_counter' / `freeze_counters') arrives with counter
-%%% interrogation in phase 7.
+%%% Counter interrogation (docs/DESIGN.md section 7) mirrors general
+%%% interrogation with its own fold and an explicit freeze/reset step
+%%% (`fold_counters' / `freeze_counters'); counters are excluded from
+%%% {@link fold/5} (see {@link iec60870_point:is_counter/1}) so the two
+%%% families never see each other's points.
 -module(iec60870_data_model).
 
 -export([is_significant_change/2]).
 
--export_type([state/0, coa/0, fold_group/0]).
+-export_type([state/0, coa/0, fold_group/0, counter_group/0, freeze/0]).
 
 -type state() :: term().
 -type coa() :: 0..65535.
 -type fold_group() :: station | 1..16.
+-type counter_group() :: station | 1..4.
+-type freeze() :: read | freeze_no_reset | freeze_reset | reset.
 
 -callback init(Args :: term()) -> {ok, state()}.
 
@@ -45,6 +50,21 @@
 
 %% Every common address the model currently holds points for.
 -callback coas(state()) -> [coa()].
+
+%% Fold the counter points of one common address, analogous to {@link fold/5}
+%% but scoped to `m_it_na_1' / `m_it_tb_1' points (`iec60870_point:is_counter/1')
+%% and to the four counter interrogation groups rather than 1..16.
+-callback fold_counters(state(), coa(), counter_group(),
+                        fun((Ioa :: non_neg_integer(), iec60870_point:point(), Acc) -> Acc),
+                        Acc) -> Acc
+    when Acc :: term().
+
+%% Apply a counter interrogation command's freeze qualifier to every counter
+%% of `(Coa, Group)' before the caller reads them back via `fold_counters/5':
+%% `read' / `freeze_no_reset' leave the stored value untouched (freezing it
+%% for read-out is implicit — `fold_counters/5' always reads the current
+%% value); `freeze_reset' / `reset' zero it.
+-callback freeze_counters(state(), coa(), counter_group(), freeze()) -> {ok, state()}.
 
 %%%===================================================================
 %%% Shared change policy

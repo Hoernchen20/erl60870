@@ -25,6 +25,13 @@
 %%%       (single/double/step) or `#{select => boolean(), ql => 0..127}'
 %%%       (set point)</li>
 %%%   <li>timestamped variants: `timestamp' is a `#cp56{}'</li>
+%%%   <li>parameter of measured value: `value' is the raw i16/float like the
+%%%       matching measured-value type, `qualifier' is `#{kind =>
+%%%       not_used|threshold_value|smoothing_factor|low_limit|high_limit|
+%%%       0..63, in_operation => boolean(), local_change => boolean()}'
+%%%       (QPM)</li>
+%%%   <li>parameter activation: `value' is `not_used|act_deact_parameter|
+%%%       act_deact_persistent_cyclic|0..127' (QPA)</li>
 %%% </ul>
 -module(iec60870_type).
 
@@ -63,6 +70,10 @@ name_to_id(c_ci_na_1) -> 101;
 name_to_id(c_rd_na_1) -> 102;
 name_to_id(c_cs_na_1) -> 103;
 name_to_id(c_ts_ta_1) -> 107;
+name_to_id(p_me_na_1) -> 110;
+name_to_id(p_me_nb_1) -> 111;
+name_to_id(p_me_nc_1) -> 112;
+name_to_id(p_ac_na_1) -> 113;
 name_to_id(N) when is_integer(N), N >= 0, N =< 255 -> N.
 
 -spec id_to_name(0..255) -> iec60870_asdu:type_name() | 0..255.
@@ -91,6 +102,10 @@ id_to_name(101) -> c_ci_na_1;
 id_to_name(102) -> c_rd_na_1;
 id_to_name(103) -> c_cs_na_1;
 id_to_name(107) -> c_ts_ta_1;
+id_to_name(110) -> p_me_na_1;
+id_to_name(111) -> p_me_nb_1;
+id_to_name(112) -> p_me_nc_1;
+id_to_name(113) -> p_ac_na_1;
 id_to_name(N) when is_integer(N), N >= 0, N =< 255 -> N.
 
 %% @doc Fixed octet length of one information element's payload (everything
@@ -121,7 +136,11 @@ payload_size(c_ic_na_1) -> 1;
 payload_size(c_ci_na_1) -> 1;
 payload_size(c_rd_na_1) -> 0;
 payload_size(c_cs_na_1) -> 7;
-payload_size(c_ts_ta_1) -> 9.
+payload_size(c_ts_ta_1) -> 9;
+payload_size(p_me_na_1) -> 3;
+payload_size(p_me_nb_1) -> 3;
+payload_size(p_me_nc_1) -> 5;
+payload_size(p_ac_na_1) -> 1.
 
 %%%===================================================================
 %%% Payload encode
@@ -186,6 +205,15 @@ encode_payload(c_cs_na_1, #object{timestamp = T}) ->
 encode_payload(c_ts_ta_1, #object{value = Tsc, timestamp = T})
   when is_integer(Tsc), Tsc >= 0, Tsc =< 65535 ->
     <<Tsc:16/little-unsigned, (cp56(T))/binary>>;
+%% --- parameter of measured value ---
+encode_payload(p_me_na_1, #object{value = V, qualifier = Ql}) ->
+    <<(i16(V))/binary, (qpm(Ql))/binary>>;
+encode_payload(p_me_nb_1, #object{value = V, qualifier = Ql}) ->
+    <<(i16(V))/binary, (qpm(Ql))/binary>>;
+encode_payload(p_me_nc_1, #object{value = V, qualifier = Ql}) ->
+    <<(f32(V))/binary, (qpm(Ql))/binary>>;
+encode_payload(p_ac_na_1, #object{value = Qpa}) ->
+    <<(qpa_int(Qpa)):8>>;
 %% --- raw escape hatch for type ids the codec does not model ---
 encode_payload(N, #object{value = Raw}) when is_integer(N) ->
     iolist_to_binary(Raw).
@@ -268,7 +296,16 @@ decode_payload(c_cs_na_1, Ioa, Bin) ->
     {#object{ioa = Ioa, timestamp = T}, R};
 decode_payload(c_ts_ta_1, Ioa, <<Tsc:16/little-unsigned, Rest/binary>>) ->
     {T, R} = cp56_take(Rest),
-    {#object{ioa = Ioa, value = Tsc, timestamp = T}, R}.
+    {#object{ioa = Ioa, value = Tsc, timestamp = T}, R};
+%% --- parameter of measured value ---
+decode_payload(p_me_na_1, Ioa, Bin) -> parameter_i16(Ioa, Bin);
+decode_payload(p_me_nb_1, Ioa, Bin) -> parameter_i16(Ioa, Bin);
+decode_payload(p_me_nc_1, Ioa, Bin) ->
+    {V, R0} = f32_take(Bin),
+    {Qpm, R1} = qpm_take(R0),
+    {#object{ioa = Ioa, value = V, qualifier = Qpm}, R1};
+decode_payload(p_ac_na_1, Ioa, <<Qpa:8, R/binary>>) ->
+    {#object{ioa = Ioa, value = qpa(Qpa)}, R}.
 
 %%%===================================================================
 %%% Shared field codecs
@@ -338,6 +375,39 @@ unfreeze(1) -> freeze_no_reset;
 unfreeze(2) -> freeze_reset;
 unfreeze(3) -> reset.
 
+%% QPM — qualifier of parameter of measured value (kind, point-in-operation,
+%% local-change flags).
+qpm(#{kind := Kind, in_operation := InOp, local_change := LPC}) ->
+    <<(bit(LPC)):1, (bit(InOp =:= false)):1, (kpa_int(Kind)):6>>.
+
+qpm_take(<<LPC:1, POP:1, KPA:6, R/binary>>) ->
+    {#{kind => kpa(KPA), in_operation => POP =:= 0, local_change => LPC =:= 1}, R}.
+
+kpa(0) -> not_used;
+kpa(1) -> threshold_value;
+kpa(2) -> smoothing_factor;
+kpa(3) -> low_limit;
+kpa(4) -> high_limit;
+kpa(N) when is_integer(N) -> N.
+
+kpa_int(not_used) -> 0;
+kpa_int(threshold_value) -> 1;
+kpa_int(smoothing_factor) -> 2;
+kpa_int(low_limit) -> 3;
+kpa_int(high_limit) -> 4;
+kpa_int(N) when is_integer(N), N >= 0, N =< 63 -> N.
+
+%% QPA — qualifier of parameter activation.
+qpa(0) -> not_used;
+qpa(1) -> act_deact_parameter;
+qpa(2) -> act_deact_persistent_cyclic;
+qpa(N) when is_integer(N) -> N.
+
+qpa_int(not_used) -> 0;
+qpa_int(act_deact_parameter) -> 1;
+qpa_int(act_deact_persistent_cyclic) -> 2;
+qpa_int(N) when is_integer(N), N >= 0, N =< 127 -> N.
+
 cp56_take(<<B:7/binary, R/binary>>) -> {iec60870_cp56:from_binary(B), R}.
 
 cp56(#cp56{} = T) -> iec60870_cp56:to_binary(T);
@@ -362,6 +432,11 @@ setpoint_i16(Ioa, Bin) ->
     {V, R0} = i16_take(Bin),
     <<SE:1, QL:7, R1/binary>> = R0,
     {#object{ioa = Ioa, value = V, qualifier = #{select => SE =:= 1, ql => QL}}, R1}.
+
+parameter_i16(Ioa, Bin) ->
+    {V, R0} = i16_take(Bin),
+    {Qpm, R1} = qpm_take(R0),
+    {#object{ioa = Ioa, value = V, qualifier = Qpm}, R1}.
 
 %%%===================================================================
 %%% Quality-list <-> bit helpers

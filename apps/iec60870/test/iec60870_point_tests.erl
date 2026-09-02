@@ -71,3 +71,8 @@ interrogable_excludes_counters_and_commands_test() ->
     ?assert(iec60870_point:interrogable(m_me_tf_1)),
     ?assertNot(iec60870_point:interrogable(m_it_na_1)),
     ?assertNot(iec60870_point:interrogable(c_sc_na_1)).
+
+is_counter_test() ->
+    ?assert(iec60870_point:is_counter(m_it_na_1)),
+    ?assert(iec60870_point:is_counter(m_it_tb_1)),
+    ?assertNot(iec60870_point:is_counter(m_sp_na_1)).

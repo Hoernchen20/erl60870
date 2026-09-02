@@ -25,9 +25,14 @@
 %%% it is just no longer fed group traffic (the `active_standby' of
 %%% docs/DESIGN.md section 4 is tracked here, not as a connection state).
 %%%
-%%% Incoming ASDUs and connection lifecycle events are relayed to the owning
-%%% {@link iec60870_server_ctl}, looked up as `{ctl, Name}' in
-%%% {@link iec60870_registry}.
+%%% Incoming ASDUs and connection lifecycle events (including `activated' /
+%%% `deactivated', docs/DESIGN.md section 7's `connection_event/2') are
+%%% relayed to the owning {@link iec60870_server_ctl}, looked up as
+%%% `{ctl, Name}' in {@link iec60870_registry}. `activated' specifically is
+%%% relayed *synchronously* ({@link iec60870_server_ctl:relay_sync/3}) so the
+%%% control process's own direct send to the newly-active connection (end of
+%%% initialization) cannot be overtaken by this module's own buffer replay to
+%%% that same connection just below.
 -module(iec60870_rgroup).
 -behaviour(gen_statem).
 
@@ -139,6 +144,10 @@ handle_event(info, {iec60870, Conn, activated}, State, Data) ->
         false ->
             keep_state_and_data;
         true ->
+            %% synchronous: must return before the replay below, so the
+            %% control process's own direct send (end of initialization) to
+            %% `Conn' cannot be overtaken by it on the wire (see relay_sync/3).
+            _ = relay_sync(activated, Conn, Data),
             case State of
                 {active, Conn} -> keep_state_and_data;
                 _ -> {next_state, {active, Conn}, replay(Conn, Data)}
@@ -146,8 +155,10 @@ handle_event(info, {iec60870, Conn, activated}, State, Data) ->
     end;
 
 handle_event(info, {iec60870, Conn, deactivated}, {active, Conn}, Data) ->
+    _ = relay(deactivated, Conn, Data),
     {next_state, no_active, Data};
-handle_event(info, {iec60870, _Conn, deactivated}, _State, _Data) ->
+handle_event(info, {iec60870, Conn, deactivated}, _State, Data) ->
+    _ = relay(deactivated, Conn, Data),
     keep_state_and_data;
 
 handle_event(info, {iec60870, Conn, {released, Index}}, {active, Conn}, Data) ->
@@ -283,6 +294,12 @@ relay(Payload, Conn, #data{name = Name}) ->
     case iec60870_registry:whereis_name({ctl, Name}) of
         undefined -> ok;
         Ctl -> iec60870_server_ctl:relay(Ctl, Conn, Payload)
+    end.
+
+relay_sync(Payload, Conn, #data{name = Name}) ->
+    case iec60870_registry:whereis_name({ctl, Name}) of
+        undefined -> ok;
+        Ctl -> iec60870_server_ctl:relay_sync(Ctl, Conn, Payload)
     end.
 
 %%%===================================================================

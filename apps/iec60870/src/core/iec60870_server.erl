@@ -20,12 +20,17 @@
 %%% The callback module is optional. When supplied it may implement
 %%% `interrogation/3' (override or supplement the automatic dump),
 %%% `connection_event/2', `select/2' + `execute/2' (direct execute and
-%%% select-before-operate for C_SC/C_DC/C_RC/C_SE, docs/DESIGN.md section 7)
-%%% and `clock_sync/3' (C_CS); `counter_interrogation/3' is declared here but
-%%% wired up in phase 7. A command left unimplemented (no callback module, or
-%%% the callback doesn't export `select/2' / `execute/2') is rejected with a
-%%% negative confirmation; an unimplemented `clock_sync/3' is acknowledged by
-%%% default, since accepting a clock sync has no unsafe side effect.
+%%% select-before-operate for C_SC/C_DC/C_RC/C_SE, docs/DESIGN.md section 7),
+%%% `clock_sync/3' (C_CS), `counter_interrogation/3' (C_CI — override or
+%%% supplement the automatic freeze + dump, same shape as `interrogation/3'),
+%%% and `set_parameter/5' + `activate_parameter/4' (P_ME_*/P_AC, docs/DESIGN.md
+%%% section 7). A command, parameter write or activation left unimplemented
+%%% (no callback module, or the callback doesn't export the matching
+%%% function) is rejected with a negative confirmation; an unimplemented
+%%% `clock_sync/3' is acknowledged by default, since accepting a clock sync
+%%% has no unsafe side effect. The read command (C_RD) and test command
+%%% (C_TS_TA_1) are pure protocol mechanics with no semantic action, so they
+%%% have no callback.
 -module(iec60870_server).
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
@@ -85,10 +90,26 @@
     {ok, CbState :: term()} | {error, iec60870_cot:cot(), CbState :: term()}.
 
 -callback counter_interrogation(Coa :: 0..65535, Qcc :: term(), CbState :: term()) ->
-    {ok, CbState :: term()}.
+    {ok, CbState :: term()}
+  | {ok, [asdu_spec()], CbState :: term()}.
+
+%% `set_parameter' answers a P_ME_NA_1/NB_1/NC_1 (parameter of measured
+%% value); `Value' is the raw i16/float like the matching measured-value
+%% type, `Qpm' is `#{kind => ..., in_operation => boolean(), local_change =>
+%% boolean()}' (see the `iec60870_type' moduledoc).
+-callback set_parameter(Coa :: 0..65535, Ioa :: non_neg_integer(),
+                        Value :: number(), Qpm :: map(), CbState :: term()) ->
+    {ok, CbState :: term()} | {error, iec60870_cot:cot(), CbState :: term()}.
+
+%% `activate_parameter' answers a P_AC_NA_1 (parameter activation); `Qpa' is
+%% `not_used | act_deact_parameter | act_deact_persistent_cyclic | 0..127'.
+-callback activate_parameter(Coa :: 0..65535, Ioa :: non_neg_integer(),
+                             Qpa :: term(), CbState :: term()) ->
+    {ok, CbState :: term()} | {error, iec60870_cot:cot(), CbState :: term()}.
 
 -optional_callbacks([interrogation/3, connection_event/2, select/2, execute/2,
-                     clock_sync/3, counter_interrogation/3]).
+                     clock_sync/3, counter_interrogation/3,
+                     set_parameter/5, activate_parameter/4]).
 
 %%%===================================================================
 %%% API
@@ -102,7 +123,11 @@ start_link(Config) when is_map(Config) ->
     iec60870_server_sup:start_link(Name, Config).
 
 %% @doc Publish one current value. `Spec' is an {@link iec60870_point} spec map
-%% (`type' and `value' are required).
+%% (`type' and `value' are required); `cot => background' sends it as a
+%% background scan (COT 2) unconditionally, bypassing the change gate that a
+%% plain (default `spontaneous', COT 3) update is subject to — the library
+%% has no cyclic scan timer of its own, so a periodic background scan is
+%% the caller's own timer repeating an `update/3' with `cot => background'.
 -spec update(server_ref(), {0..65535, non_neg_integer()}, map()) -> ok.
 update(Server, {Coa, Ioa}, Spec) when is_map(Spec) ->
     update(Server, [{{Coa, Ioa}, Spec}]).

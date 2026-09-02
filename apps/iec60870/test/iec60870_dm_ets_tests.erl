@@ -57,6 +57,45 @@ fold_is_coa_scoped_test() ->
     ok = iec60870_dm_ets:terminate(S).
 
 %%%===================================================================
+%%% counter interrogation
+%%%===================================================================
+
+fold_counters_station_vs_group_test() ->
+    S = new(),
+    put_counter(S, 1, 50, 100, 1),
+    put_counter(S, 1, 51, 200, 2),
+    put_point(S, 1, 52, m_sp_na_1, true, undefined),
+    ?assertEqual([50, 51], fold_counter_ioas(S, 1, station)),
+    ?assertEqual([50], fold_counter_ioas(S, 1, 1)),
+    ?assertEqual([51], fold_counter_ioas(S, 1, 2)),
+    ok = iec60870_dm_ets:terminate(S).
+
+freeze_counters_read_leaves_value_test() ->
+    S = new(),
+    put_counter(S, 1, 50, 100, 1),
+    {ok, S} = iec60870_dm_ets:freeze_counters(S, 1, station, read),
+    ?assertMatch({ok, #{value := 100}}, iec60870_dm_ets:read(S, 1, 50)),
+    ok = iec60870_dm_ets:terminate(S).
+
+freeze_counters_reset_zeroes_matching_group_test() ->
+    S = new(),
+    put_counter(S, 1, 50, 100, 1),
+    put_counter(S, 1, 51, 200, 2),
+    {ok, S} = iec60870_dm_ets:freeze_counters(S, 1, 1, reset),
+    ?assertMatch({ok, #{value := 0}}, iec60870_dm_ets:read(S, 1, 50)),
+    ?assertMatch({ok, #{value := 200}}, iec60870_dm_ets:read(S, 1, 51)),
+    ok = iec60870_dm_ets:terminate(S).
+
+freeze_counters_reset_bumps_sequence_test() ->
+    S = new(),
+    put_counter(S, 1, 50, 100, 1),
+    {ok, #{value := 100, qualifier := #{sequence := Seq0}}} = iec60870_dm_ets:read(S, 1, 50),
+    {ok, S} = iec60870_dm_ets:freeze_counters(S, 1, station, freeze_reset),
+    {ok, #{qualifier := #{sequence := Seq1}}} = iec60870_dm_ets:read(S, 1, 50),
+    ?assertEqual((Seq0 + 1) rem 32, Seq1),
+    ok = iec60870_dm_ets:terminate(S).
+
+%%%===================================================================
 %%% preload
 %%%===================================================================
 
@@ -86,3 +125,11 @@ put_point(S, Coa, Ioa, Type, Value, Group) ->
 fold_ioas(S, Coa, Group) ->
     lists:sort(iec60870_dm_ets:fold(S, Coa, Group,
                                     fun(Ioa, _P, Acc) -> [Ioa | Acc] end, [])).
+
+put_counter(S, Coa, Ioa, Value, Group) ->
+    P = iec60870_point:spec_to_point(#{type => m_it_na_1, value => Value, group => Group}),
+    {ok, _, _} = iec60870_dm_ets:write(S, Coa, Ioa, P).
+
+fold_counter_ioas(S, Coa, Group) ->
+    lists:sort(iec60870_dm_ets:fold_counters(S, Coa, Group,
+                                             fun(Ioa, _P, Acc) -> [Ioa | Acc] end, [])).

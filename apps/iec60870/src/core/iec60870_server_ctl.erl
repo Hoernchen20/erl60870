@@ -16,20 +16,23 @@
 %%%       hands them to every redundancy group (each buffers / replays on its
 %%%       own — docs/DESIGN.md section 5);</li>
 %%%   <li>runs commands (C_SC/C_DC/C_RC/C_SE) — direct execute and
-%%%       select-before-operate, sync or async — and clock sync (C_CS),
-%%%       docs/DESIGN.md section 7.</li>
+%%%       select-before-operate, sync or async — clock sync (C_CS), counter
+%%%       interrogation (C_CI), the read command (C_RD), the test command
+%%%       (C_TS_TA_1) and parameter of measured value / parameter activation
+%%%       (P_ME_*/P_AC), docs/DESIGN.md section 7;</li>
+%%%   <li>sends the end-of-initialization ASDU (M_EI_NA_1, COT `initialized')
+%%%       to a connection right after it activates, config key `coi'.</li>
 %%% </ul>
 %%%
 %%% The redundancy groups own the connections; they {@link relay/3} incoming
 %%% ASDUs and connection lifecycle events here. Interrogation and command
-%%% replies are sent straight back on the requesting connection. Counter
-%%% interrogation is answered with a negative confirmation until phase 7.
+%%% replies are sent straight back on the requesting connection.
 -module(iec60870_server_ctl).
 -behaviour(gen_server).
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
--export([start_link/2, relay/3]).
+-export([start_link/2, relay/3, relay_sync/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
 
@@ -46,6 +49,7 @@
     cb_state = undefined       :: term(),
     select_timeout = 10000     :: pos_integer(),
     clock_sync_con = true      :: boolean(),
+    coi = 0                    :: 0..127 | false,
     %% {Coa, Ioa} -> outstanding select (docs/DESIGN.md section 7)
     selects = #{}              :: #{{0..65535, non_neg_integer()} => select()},
     %% async-execute reference -> what to answer with when it resolves
@@ -70,6 +74,19 @@ start_link(Name, Config) ->
 -spec relay(pid(), pid(), term()) -> ok.
 relay(Ctl, Conn, Payload) ->
     gen_server:cast(Ctl, {owner_event, Conn, Payload}).
+
+%% @doc Like {@link relay/3}, but waits for this control process to have
+%% finished handling `Payload' before returning. Used only for `activated'
+%% (docs/DESIGN.md section 7, end of initialization): a redundancy group
+%% promoting a newly-activated connection replays its buffer to that same
+%% connection right after this call returns, and that replay must not
+%% overtake the end-of-initialization ASDU this control process sends
+%% directly to the connection while handling `activated' — a plain
+%% (asynchronous) `relay/3' gives no such ordering guarantee between the two
+%% independent senders.
+-spec relay_sync(pid(), pid(), term()) -> ok.
+relay_sync(Ctl, Conn, Payload) ->
+    gen_server:call(Ctl, {owner_event, Conn, Payload}).
 
 %%%===================================================================
 %%% gen_server
@@ -114,7 +131,8 @@ do_init(Name, Config, RgroupSup) ->
                         dm_mod = DmMod, dm_state = DmState,
                         cb_mod = CbMod, cb_state = CbState,
                         select_timeout = maps:get(select_timeout, Config, 10000),
-                        clock_sync_con = maps:get(clock_sync_confirm, Config, true)}};
+                        clock_sync_con = maps:get(clock_sync_confirm, Config, true),
+                        coi = maps:get(coi, Config, 0)}};
                 {error, Reason} ->
                     _ = DmMod:terminate(DmState),
                     _ = iec60870_registry:unregister_name({ctl, Name}),
@@ -159,6 +177,9 @@ join(RgroupSup, Id) ->
 
 handle_call(port, _From, #state{listener_ref = Ref} = State) ->
     {reply, ranch:get_port(Ref), State};
+handle_call({owner_event, Conn, Payload}, _From, State) ->
+    {noreply, State1} = handle_owner(Payload, Conn, State),
+    {reply, ok, State1};
 handle_call(_Request, _From, State) ->
     {reply, {error, bad_request}, State}.
 
@@ -201,6 +222,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 handle_owner(activated, Conn, State) ->
+    send_end_of_init(Conn, State),
     {noreply, cb_event({activated, Conn}, State)};
 handle_owner(deactivated, Conn, State) ->
     {noreply, cb_event({deactivated, Conn}, State)};
@@ -219,6 +241,24 @@ handle_owner({outbox_overflow, Dropped}, _Conn, #state{name = Name} = State) ->
 handle_owner(_Other, _Conn, State) ->
     {noreply, State}.
 
+%% One M_EI_NA_1 (end of initialization) per configured COA, straight to the
+%% connection that just activated — docs/DESIGN.md section 7. Sent on every
+%% activation (including a reconnect), not just once at server startup, so it
+%% works the same way under all three redundancy modes (docs/DESIGN.md
+%% section 5) instead of depending on a group already existing to buffer it.
+%% Config key `coi' (0..127, the cause-of-initialization byte) defaults to 0
+%% ("local power switch on"); `coi => false' disables it for callers managing
+%% M_EI by hand via `send_asdu/3'.
+send_end_of_init(_Conn, #state{coi = false}) ->
+    ok;
+send_end_of_init(Conn, #state{coi = Coi, coas = Coas}) ->
+    lists:foreach(
+      fun(Coa) ->
+              send_to(Conn, #asdu{type = m_ei_na_1, cot = initialized, coa = Coa,
+                                  objects = [#object{ioa = 0, value = Coi,
+                                                     qualifier = #{local_change => false}}]})
+      end, Coas).
+
 %%%===================================================================
 %%% Incoming ASDU routing
 %%%===================================================================
@@ -228,14 +268,24 @@ route(#asdu{type = c_ic_na_1, cot = act} = Asdu, Conn, State) ->
 route(#asdu{type = c_ic_na_1, cot = deact} = Asdu, Conn, State) ->
     send_to(Conn, Asdu#asdu{cot = deact_con}),
     {noreply, State};
+route(#asdu{type = c_ci_na_1, cot = act} = Asdu, Conn, State) ->
+    counter_interrogate(Asdu, Conn, State);
+route(#asdu{type = c_rd_na_1} = Asdu, Conn, State) ->
+    read_command(Asdu, Conn, State);
 route(#asdu{type = c_cs_na_1, cot = act} = Asdu, Conn, State) ->
     clock_sync(Asdu, Conn, State);
+route(#asdu{type = c_ts_ta_1, cot = act} = Asdu, Conn, State) ->
+    test_command(Asdu, Conn, State);
+route(#asdu{type = Type, cot = act} = Asdu, Conn, State)
+  when Type =:= p_me_na_1; Type =:= p_me_nb_1; Type =:= p_me_nc_1 ->
+    set_parameter(Asdu, Conn, State);
+route(#asdu{type = p_ac_na_1, cot = act} = Asdu, Conn, State) ->
+    activate_parameter(Asdu, Conn, State);
 route(#asdu{cot = act} = Asdu, Conn, State) ->
     case iec60870_command:is_command(Asdu#asdu.type) of
         true ->
             command(Asdu, Conn, State);
         false ->
-            %% counter interrogation, read command, ... — not until phase 7.
             send_to(Conn, Asdu#asdu{cot = unknown_type_id, negative = true, objects = []}),
             {noreply, State}
     end;
@@ -311,6 +361,196 @@ call_interrogation(CbMod, Coa, Qoi, CbState) ->
             case CbMod:interrogation(Coa, Qoi, CbState) of
                 {ok, CbState1} -> {library, CbState1};
                 {ok, Specs, CbState1} when is_list(Specs) -> {explicit, Specs, CbState1}
+            end
+    end.
+
+%%%===================================================================
+%%% Counter interrogation (C_CI_NA_1) — docs/DESIGN.md section 7
+%%%===================================================================
+
+counter_interrogate(#asdu{coa = Coa, orig_addr = OA, test = Test,
+                          objects = [#object{value = #{request := Rqt} = Qcc}]} = Asdu,
+                    Conn, #state{coas = Coas} = State) ->
+    Mirror = fun(Cot, Neg) -> Asdu#asdu{cot = Cot, negative = Neg} end,
+    case lists:member(Coa, Coas) andalso rqt_group(Rqt) of
+        false ->
+            send_to(Conn, Mirror(act_con, true)),
+            {noreply, State};
+        Group ->
+            send_to(Conn, Mirror(act_con, false)),
+            {Dump, State1} = counter_dump(Coa, Qcc, Group, OA, Test, State),
+            lists:foreach(fun(A) -> send_to(Conn, A) end, Dump),
+            send_to(Conn, Mirror(act_term, false)),
+            {noreply, State1}
+    end;
+counter_interrogate(_Asdu, _Conn, State) ->
+    %% malformed C_CI — no QCC object
+    {noreply, State}.
+
+rqt_group(5) -> station;
+rqt_group(N) when is_integer(N), N >= 1, N =< 4 -> N;
+rqt_group(_) -> false.
+
+%% The dump reads the pre-freeze values — `freeze_reset' / `reset' only zero
+%% the store *after* they have been reported, so the delivered value is the
+%% one at the moment of the command, matching the BCR freeze semantics.
+counter_dump(Coa, Qcc, Group, OA, Test,
+             #state{cb_mod = CbMod, cb_state = CbState0} = State) ->
+    case call_counter_interrogation(CbMod, Coa, Qcc, CbState0) of
+        {library, CbState1} ->
+            State1 = State#state{cb_state = CbState1},
+            Asdus = stamp(library_counter_dump(Coa, Group, State1), OA, Test),
+            {ok, DmState1} = (State1#state.dm_mod):freeze_counters(
+                               State1#state.dm_state, Coa, Group, maps:get(freeze, Qcc)),
+            {Asdus, State1#state{dm_state = DmState1}};
+        {explicit, Specs, CbState1} ->
+            {[spec_to_asdu(S) || S <- Specs], State#state{cb_state = CbState1}}
+    end.
+
+library_counter_dump(Coa, Group, #state{dm_mod = DmMod, dm_state = DmState,
+                                        asdu_opts = Opts}) ->
+    Cot = case Group of
+              station -> interrogated_counter;
+              N -> {interrogated_counter_group, N}
+          end,
+    ByType = DmMod:fold_counters(DmState, Coa, Group,
+                        fun(Ioa, Point, Acc) ->
+                                Type = maps:get(type, Point),
+                                Obj = iec60870_point:to_object(Type, Ioa, Point),
+                                maps:update_with(Type, fun(L) -> [Obj | L] end,
+                                                 [Obj], Acc)
+                        end, #{}),
+    Groups = [{{Type, Coa, Cot}, Objs} || Type := Objs <- ByType],
+    iec60870_batch:pack(Groups, Opts).
+
+call_counter_interrogation(undefined, _Coa, _Qcc, CbState) ->
+    {library, CbState};
+call_counter_interrogation(CbMod, Coa, Qcc, CbState) ->
+    case erlang:function_exported(CbMod, counter_interrogation, 3) of
+        false ->
+            {library, CbState};
+        true ->
+            case CbMod:counter_interrogation(Coa, Qcc, CbState) of
+                {ok, CbState1} -> {library, CbState1};
+                {ok, Specs, CbState1} when is_list(Specs) -> {explicit, Specs, CbState1}
+            end
+    end.
+
+%%%===================================================================
+%%% Read command (C_RD_NA_1) — docs/DESIGN.md section 7
+%%%===================================================================
+
+%% No act_con/act_term — the reply is the addressed point's current type
+%% ASDU, COT `request' (5, "used only by read command"), or a negative
+%% confirmation of the read command itself on a bad COA / unknown IOA.
+read_command(#asdu{coa = Coa, orig_addr = OA, test = Test,
+                   objects = [#object{ioa = Ioa}]} = Asdu, Conn,
+             #state{coas = Coas, dm_mod = DmMod, dm_state = DmState} = State) ->
+    case lists:member(Coa, Coas) of
+        false ->
+            send_to(Conn, Asdu#asdu{cot = unknown_coa, negative = true});
+        true ->
+            case DmMod:read(DmState, Coa, Ioa) of
+                {ok, Point} ->
+                    Type = maps:get(type, Point),
+                    Obj = iec60870_point:to_object(Type, Ioa, Point),
+                    send_to(Conn, #asdu{type = Type, cot = request, test = Test,
+                                        orig_addr = OA, coa = Coa, objects = [Obj]});
+                not_found ->
+                    send_to(Conn, Asdu#asdu{cot = unknown_ioa, negative = true})
+            end
+    end,
+    {noreply, State};
+read_command(_Asdu, _Conn, State) ->
+    %% malformed C_RD — no IOA object
+    {noreply, State}.
+
+%%%===================================================================
+%%% Test command (C_TS_TA_1) — docs/DESIGN.md section 7
+%%%===================================================================
+
+%% Pure echo — no semantic action, so no callback: the same test pattern and
+%% timestamp mirrored back with a positive/negative act_con per COA.
+test_command(#asdu{coa = Coa} = Asdu, Conn, #state{coas = Coas} = State) ->
+    Negative = not lists:member(Coa, Coas),
+    send_to(Conn, Asdu#asdu{cot = act_con, negative = Negative}),
+    {noreply, State}.
+
+%%%===================================================================
+%%% Parameter of measured value / activation (P_ME_*/P_AC) — docs/DESIGN.md
+%%% section 7
+%%%===================================================================
+
+set_parameter(#asdu{coa = Coa,
+                    objects = [#object{ioa = Ioa, value = Value, qualifier = Qpm}]} = Asdu,
+              Conn, #state{coas = Coas} = State) ->
+    case lists:member(Coa, Coas) of
+        false ->
+            send_to(Conn, Asdu#asdu{cot = act_con, negative = true}),
+            {noreply, State};
+        true ->
+            case call_set_parameter(Coa, Ioa, Value, Qpm, State) of
+                {ok, State1} ->
+                    send_to(Conn, Asdu#asdu{cot = act_con, negative = false}),
+                    send_to(Conn, Asdu#asdu{cot = act_term, negative = false}),
+                    {noreply, State1};
+                {error, Cot, State1} ->
+                    send_to(Conn, Asdu#asdu{cot = neg_cot(Cot), negative = true}),
+                    {noreply, State1}
+            end
+    end;
+set_parameter(_Asdu, _Conn, State) ->
+    %% malformed P_ME_* — not exactly one object
+    {noreply, State}.
+
+%% No callback module, or one that doesn't opt into `set_parameter/5':
+%% rejected by default — same reasoning as commands (unsafe to no-op).
+call_set_parameter(_Coa, _Ioa, _Value, _Qpm, #state{cb_mod = undefined} = State) ->
+    {error, act_con, State};
+call_set_parameter(Coa, Ioa, Value, Qpm, #state{cb_mod = CbMod, cb_state = CbState} = State) ->
+    case erlang:function_exported(CbMod, set_parameter, 5) of
+        false ->
+            {error, act_con, State};
+        true ->
+            case CbMod:set_parameter(Coa, Ioa, Value, Qpm, CbState) of
+                {ok, CbState1} -> {ok, State#state{cb_state = CbState1}};
+                {error, Cot, CbState1} -> {error, Cot, State#state{cb_state = CbState1}}
+            end
+    end.
+
+activate_parameter(#asdu{coa = Coa, objects = [#object{ioa = Ioa, value = Qpa}]} = Asdu,
+                   Conn, #state{coas = Coas} = State) ->
+    case lists:member(Coa, Coas) of
+        false ->
+            send_to(Conn, Asdu#asdu{cot = act_con, negative = true}),
+            {noreply, State};
+        true ->
+            case call_activate_parameter(Coa, Ioa, Qpa, State) of
+                {ok, State1} ->
+                    send_to(Conn, Asdu#asdu{cot = act_con, negative = false}),
+                    send_to(Conn, Asdu#asdu{cot = act_term, negative = false}),
+                    {noreply, State1};
+                {error, Cot, State1} ->
+                    send_to(Conn, Asdu#asdu{cot = neg_cot(Cot), negative = true}),
+                    {noreply, State1}
+            end
+    end;
+activate_parameter(_Asdu, _Conn, State) ->
+    %% malformed P_AC — not exactly one object
+    {noreply, State}.
+
+%% No callback module, or one that doesn't opt into `activate_parameter/4':
+%% rejected by default — same reasoning as commands (unsafe to no-op).
+call_activate_parameter(_Coa, _Ioa, _Qpa, #state{cb_mod = undefined} = State) ->
+    {error, act_con, State};
+call_activate_parameter(Coa, Ioa, Qpa, #state{cb_mod = CbMod, cb_state = CbState} = State) ->
+    case erlang:function_exported(CbMod, activate_parameter, 4) of
+        false ->
+            {error, act_con, State};
+        true ->
+            case CbMod:activate_parameter(Coa, Ioa, Qpa, CbState) of
+                {ok, CbState1} -> {ok, State#state{cb_state = CbState1}};
+                {error, Cot, CbState1} -> {error, Cot, State#state{cb_state = CbState1}}
             end
     end.
 
@@ -516,17 +756,21 @@ apply_writes([], State, Acc) ->
     {Acc, State};
 apply_writes([{{Coa, Ioa}, Spec} | Rest], #state{dm_mod = DmMod} = State, Acc) ->
     Point = iec60870_point:spec_to_point(Spec),
+    %% `cot => background' (a background scan, docs/DESIGN.md section 8) is
+    %% always sent, unlike a plain `spontaneous' update which is gated on
+    %% `Changed'.
+    Cot = maps:get(cot, Spec, spontaneous),
     {ok, DmState1, Changed} = DmMod:write(State#state.dm_state, Coa, Ioa, Point),
-    Acc1 = case Changed of
-               true -> [{Coa, Ioa, maps:get(type, Point), Point} | Acc];
+    Acc1 = case Cot =:= background orelse Changed of
+               true -> [{Coa, Ioa, maps:get(type, Point), Point, Cot} | Acc];
                false -> Acc
            end,
     apply_writes(Rest, State#state{dm_state = DmState1}, Acc1).
 
 spontaneous_groups(Changed) ->
     ByKey = lists:foldl(
-              fun({Coa, Ioa, Type, Point}, Acc) ->
-                      Key = {Type, Coa, spontaneous},
+              fun({Coa, Ioa, Type, Point, Cot}, Acc) ->
+                      Key = {Type, Coa, Cot},
                       Obj = iec60870_point:to_object(Type, Ioa, Point),
                       maps:update_with(Key, fun(L) -> [Obj | L] end, [Obj], Acc)
               end, #{}, Changed),

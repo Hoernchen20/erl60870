@@ -35,7 +35,11 @@
          setpoint_scaled/2, setpoint_scaled/3,
          setpoint_short/2, setpoint_short/3,
          interrogation/1, counter_interrogation/1,
-         read_command/1, clock_sync/1, test_command/2]).
+         read_command/1, clock_sync/1, test_command/2,
+         parameter_normalized/3, parameter_normalized/4,
+         parameter_scaled/3, parameter_scaled/4,
+         parameter_short/3, parameter_short/4,
+         parameter_activation/2]).
 
 -export_type([type_name/0, cot_size/0, coa_size/0, ioa_size/0, quality_flag/0,
               opts/0, decode_error/0]).
@@ -52,7 +56,8 @@
       | m_ei_na_1
       | c_sc_na_1 | c_dc_na_1 | c_rc_na_1
       | c_se_na_1 | c_se_nb_1 | c_se_nc_1
-      | c_ic_na_1 | c_ci_na_1 | c_rd_na_1 | c_cs_na_1 | c_ts_ta_1.
+      | c_ic_na_1 | c_ci_na_1 | c_rd_na_1 | c_cs_na_1 | c_ts_ta_1
+      | p_me_na_1 | p_me_nb_1 | p_me_nc_1 | p_ac_na_1.
 
 %% Configurable field widths of the data-unit identifier / IOA (docs/DESIGN.md
 %% section 9, `params').
@@ -255,6 +260,24 @@ clock_sync(#cp56{} = Time) ->
 
 test_command(Tsc, #cp56{} = Time) when is_integer(Tsc) ->
     #object{ioa = 0, value = Tsc, timestamp = Time}.
+
+parameter_normalized(Ioa, Raw, Kind) -> parameter_normalized(Ioa, Raw, Kind, #{}).
+parameter_normalized(Ioa, Raw, Kind, Opts) -> parameter(Ioa, Raw, Kind, Opts).
+
+parameter_scaled(Ioa, Raw, Kind) -> parameter_scaled(Ioa, Raw, Kind, #{}).
+parameter_scaled(Ioa, Raw, Kind, Opts) -> parameter(Ioa, Raw, Kind, Opts).
+
+parameter_short(Ioa, Value, Kind) -> parameter_short(Ioa, Value, Kind, #{}).
+parameter_short(Ioa, Value, Kind, Opts) -> parameter(Ioa, Value, Kind, Opts).
+
+parameter_activation(Ioa, Qpa) ->
+    #object{ioa = Ioa, value = Qpa}.
+
+parameter(Ioa, Value, Kind, Opts) ->
+    #object{ioa = Ioa, value = Value,
+            qualifier = #{kind => Kind,
+                          in_operation => maps:get(in_operation, Opts, true),
+                          local_change => maps:get(local_change, Opts, false)}}.
 
 monitored(Ioa, Value, Opts) ->
     #object{ioa = Ioa, value = Value,

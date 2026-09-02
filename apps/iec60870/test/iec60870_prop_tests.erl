@@ -45,13 +45,15 @@ all_types() ->
      m_me_na_1, m_me_nb_1, m_me_nc_1, m_me_td_1, m_me_te_1, m_me_tf_1,
      m_it_na_1, m_it_tb_1, m_ei_na_1,
      c_sc_na_1, c_dc_na_1, c_rc_na_1, c_se_na_1, c_se_nb_1, c_se_nc_1,
-     c_ic_na_1, c_ci_na_1, c_rd_na_1, c_cs_na_1, c_ts_ta_1].
+     c_ic_na_1, c_ci_na_1, c_rd_na_1, c_cs_na_1, c_ts_ta_1,
+     p_me_na_1, p_me_nb_1, p_me_nc_1, p_ac_na_1].
 
 %% SQ=1 only for the monitored types with a fixed-size payload.
 sq_gen(Type) ->
     case lists:member(Type, [m_sp_na_1, m_sp_tb_1, m_dp_na_1, m_dp_tb_1, m_st_na_1,
                              m_me_na_1, m_me_nb_1, m_me_nc_1, m_me_td_1, m_me_te_1,
-                             m_me_tf_1, m_it_na_1, m_it_tb_1]) of
+                             m_me_tf_1, m_it_na_1, m_it_tb_1,
+                             p_me_na_1, p_me_nb_1, p_me_nc_1]) of
         true -> boolean();
         false -> false
     end.
@@ -126,7 +128,22 @@ obj_gen(c_ci_na_1) ->
 obj_gen(c_rd_na_1) -> #object{};
 obj_gen(c_cs_na_1) -> ?LET(T, cp56_g(), #object{timestamp = T});
 obj_gen(c_ts_ta_1) -> ?LET({V, T}, {range(0, 65535), cp56_g()},
-                           #object{value = V, timestamp = T}).
+                           #object{value = V, timestamp = T});
+obj_gen(p_me_na_1) -> param_obj(i16_g());
+obj_gen(p_me_nb_1) -> param_obj(i16_g());
+obj_gen(p_me_nc_1) -> param_obj(f32_g());
+obj_gen(p_ac_na_1) ->
+    ?LET(Q, oneof([not_used, act_deact_parameter,
+                  act_deact_persistent_cyclic, range(3, 127)]),
+         #object{value = Q}).
+
+param_obj(ValGen) ->
+    ?LET({V, K, InOp, LPC},
+         {ValGen, oneof([not_used, threshold_value, smoothing_factor,
+                        low_limit, high_limit, range(5, 63)]),
+          boolean(), boolean()},
+         #object{value = V, qualifier = #{kind => K, in_operation => InOp,
+                                          local_change => LPC}}).
 
 measured(ValGen) ->
     ?LET({V, Q}, {ValGen, qual_full()}, #object{value = V, quality = Q}).

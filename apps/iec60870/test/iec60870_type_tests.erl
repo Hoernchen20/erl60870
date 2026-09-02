@@ -12,7 +12,8 @@ id_map_roundtrip_test() ->
              m_me_na_1, m_me_nb_1, m_me_nc_1, m_me_td_1, m_me_te_1, m_me_tf_1,
              m_it_na_1, m_it_tb_1, m_ei_na_1,
              c_sc_na_1, c_dc_na_1, c_rc_na_1, c_se_na_1, c_se_nb_1, c_se_nc_1,
-             c_ic_na_1, c_ci_na_1, c_rd_na_1, c_cs_na_1, c_ts_ta_1],
+             c_ic_na_1, c_ci_na_1, c_rd_na_1, c_cs_na_1, c_ts_ta_1,
+             p_me_na_1, p_me_nb_1, p_me_nc_1, p_ac_na_1],
     [?assertEqual(N, iec60870_type:id_to_name(iec60870_type:name_to_id(N)))
      || N <- Names].
 
@@ -202,6 +203,40 @@ end_of_init_test() ->
     Obj = #object{ioa = 0, value = 2, qualifier = #{local_change => true}},
     ?assertEqual(<<16#82>>, enc(m_ei_na_1, Obj)),
     ?assertEqual(Obj, dec(m_ei_na_1, 0, <<16#82>>)).
+
+%%%===================================================================
+%%% Parameter of measured value / activation
+%%%===================================================================
+
+parameter_qpm_test() ->
+    %% LPC=1, POP=0 (in operation), KPA=3 (low limit) -> 16#83
+    Obj = #object{ioa = 0, value = -100,
+                  qualifier = #{kind => low_limit, in_operation => true,
+                               local_change => true}},
+    Bin = enc(p_me_nb_1, Obj),
+    ?assertEqual(3, byte_size(Bin)),
+    <<_V:16, LPC:1, POP:1, KPA:6>> = Bin,
+    ?assertEqual({1, 0, 3}, {LPC, POP, KPA}),
+    ?assertEqual(Obj, dec(p_me_nb_1, 0, Bin)).
+
+parameter_not_in_operation_test() ->
+    Obj = #object{ioa = 5, value = 12.5,
+                  qualifier = #{kind => not_used, in_operation => false,
+                               local_change => false}},
+    ?assertEqual(Obj, dec(p_me_nc_1, 5, enc(p_me_nc_1, Obj))).
+
+parameter_reserved_kind_passthrough_test() ->
+    Obj = #object{ioa = 1, value = 7,
+                  qualifier = #{kind => 40, in_operation => true,
+                               local_change => false}},
+    ?assertEqual(Obj, dec(p_me_na_1, 1, enc(p_me_na_1, Obj))).
+
+parameter_activation_test() ->
+    ?assertEqual(<<2>>, enc(p_ac_na_1, #object{ioa = 3, value = act_deact_persistent_cyclic})),
+    ?assertEqual(#object{ioa = 3, value = act_deact_parameter},
+                 dec(p_ac_na_1, 3, <<1>>)),
+    %% reserved/special-use codes pass through as raw integers.
+    ?assertEqual(#object{ioa = 3, value = 99}, dec(p_ac_na_1, 3, <<99>>)).
 
 %%%===================================================================
 %%% Timestamped monitored variants keep the 7-octet tail

@@ -17,7 +17,8 @@
 -module(iec60870_dm_ets).
 -behaviour(iec60870_data_model).
 
--export([init/1, terminate/1, read/3, write/4, fold/5, coas/1]).
+-export([init/1, terminate/1, read/3, write/4, fold/5, coas/1,
+         fold_counters/5, freeze_counters/4]).
 
 -type state() :: #{tab := ets:table()}.
 -export_type([state/0]).
@@ -74,6 +75,43 @@ fold(#{tab := Tab}, Coa, Group, Fun, Acc0) ->
 coas(#{tab := Tab}) ->
     lists:usort(ets:select(Tab, [{{{'$1', '_'}, '_'}, [], ['$1']}])).
 
+-spec fold_counters(state(), iec60870_data_model:coa(), iec60870_data_model:counter_group(),
+                    fun((non_neg_integer(), iec60870_point:point(), Acc) -> Acc), Acc) -> Acc.
+fold_counters(#{tab := Tab}, Coa, Group, Fun, Acc0) ->
+    ets:foldl(
+      fun({{C, Ioa}, Point}, Acc) when C =:= Coa ->
+              case in_counter_group(Group, Point) of
+                  true -> Fun(Ioa, Point, Acc);
+                  false -> Acc
+              end;
+         (_Entry, Acc) ->
+              Acc
+      end, Acc0, Tab).
+
+-spec freeze_counters(state(), iec60870_data_model:coa(), iec60870_data_model:counter_group(),
+                      iec60870_data_model:freeze()) -> {ok, state()}.
+freeze_counters(#{tab := Tab} = State, Coa, Group, Freeze)
+  when Freeze =:= freeze_reset; Freeze =:= reset ->
+    Keys = ets:foldl(
+             fun({{C, _Ioa} = Key, Point}, Acc) when C =:= Coa ->
+                     case in_counter_group(Group, Point) of
+                         true -> [Key | Acc];
+                         false -> Acc
+                     end;
+                (_Entry, Acc) ->
+                     Acc
+             end, [], Tab),
+    lists:foreach(
+      fun(Key) ->
+              [{_, Point}] = ets:lookup(Tab, Key),
+              true = ets:insert(Tab, {Key, reset_counter(Point)})
+      end, Keys),
+    {ok, State};
+freeze_counters(State, _Coa, _Group, _Freeze) ->
+    %% `read' / `freeze_no_reset': the stored value is left as-is —
+    %% `fold_counters/5' reads it back unchanged.
+    {ok, State}.
+
 %%%===================================================================
 %%% Internal
 %%%===================================================================
@@ -82,6 +120,15 @@ in_group(station, #{type := Type}) ->
     iec60870_point:interrogable(Type);
 in_group(N, #{type := Type, group := Group}) ->
     Group =:= N andalso iec60870_point:interrogable(Type).
+
+in_counter_group(station, #{type := Type}) ->
+    iec60870_point:is_counter(Type);
+in_counter_group(N, #{type := Type, group := Group}) ->
+    Group =:= N andalso iec60870_point:is_counter(Type).
+
+reset_counter(#{qualifier := Ql} = Point) ->
+    Seq = maps:get(sequence, Ql, 0),
+    Point#{value => 0, qualifier => Ql#{sequence => (Seq + 1) rem 32}}.
 
 preload(_Tab, []) ->
     ok;

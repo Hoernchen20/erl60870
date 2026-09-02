@@ -101,7 +101,9 @@ single_mode_one_active(Config) ->
     A = active(Config),
     update(Config, 100, true),
     ?assertEqual({100, true}, sp(recv_asdu(A))),
-    ack(A, 1),
+    %% N(R)=2: the automatic end-of-init I-frame (drained by active/1) and
+    %% the update above are sequence 0 and 1 respectively.
+    ack(A, 2),
     wait_until(fun() -> buffer_len(Config) =:= 0 end),
 
     B = active(Config),
@@ -135,7 +137,9 @@ single_mode_released_shrinks_buffer(Config) ->
     [_, _, _] = [recv_asdu(A) || _ <- [1, 2, 3]],
 
     ?assertEqual(3, buffer_len(Config)),
-    ack(A, 3),
+    %% N(R)=4: the automatic end-of-init I-frame (drained by active/1) plus
+    %% the three updates above are sequence 0 through 3.
+    ack(A, 4),
     wait_until(fun() -> buffer_len(Config) =:= 0 end),
     ?assertEqual(3, maps:get(released, group_info(Config))).
 
@@ -145,6 +149,7 @@ single_mode_buffers_until_active(Config) ->
     ok = expect_no_data(S, 300),
     ?assertEqual(1, buffer_len(Config)),
     ok = do_startdt(S),
+    ?assertMatch(#asdu{type = m_ei_na_1}, recv_asdu(S)),
     ?assertEqual({100, true}, sp(recv_asdu(S))).
 
 %%%===================================================================
@@ -208,14 +213,20 @@ connect_opts(Config, Extra) ->
                               [binary, {active, false}, {packet, 0} | Extra], 1000),
     S.
 
+%% Every server config in this suite leaves `coi' at its library default
+%% (enabled), so activation always delivers one automatic end-of-init ASDU
+%% (M_EI_NA_1) first — drained here so the rest of each test only sees the
+%% frames it triggers itself (see docs/DESIGN.md section 7).
 active(Config) ->
     S = connect(Config),
     ok = do_startdt(S),
+    ?assertMatch(#asdu{type = m_ei_na_1}, recv_asdu(S)),
     S.
 
 active_from(Config, SrcIp) ->
     S = connect_from(Config, SrcIp),
     ok = do_startdt(S),
+    ?assertMatch(#asdu{type = m_ei_na_1}, recv_asdu(S)),
     S.
 
 do_startdt(S) ->

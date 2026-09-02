@@ -13,6 +13,11 @@
 %%%     group => 3}                 %% interrogation group 1..16, or undefined
 %%% '''
 %%%
+%%% For a counter (`m_it_na_1' / `m_it_tb_1', excluded from general
+%%% interrogation, see {@link is_counter/1}) `group' instead means the counter
+%%% interrogation group 1..4 (docs/DESIGN.md section 7) — the two families
+%%% never overlap on one point since a point has exactly one type.
+%%%
 %%% This module normalises such a map ({@link spec_to_point/1}) and turns a
 %%% stored point into the `#object{}' the codec consumes ({@link to_object/3}).
 %%% It is transport-free and lives in `src/asdu/' with the rest of the
@@ -21,7 +26,8 @@
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
--export([spec_to_point/1, to_object/3, is_timestamped/1, interrogable/1]).
+-export([spec_to_point/1, to_object/3, is_timestamped/1, interrogable/1,
+         is_counter/1]).
 
 -export_type([point/0, group/0]).
 
@@ -125,3 +131,10 @@ interrogable(m_me_td_1) -> true;
 interrogable(m_me_te_1) -> true;
 interrogable(m_me_tf_1) -> true;
 interrogable(_) -> false.
+
+%% @doc Whether a point of this type answers to counter interrogation
+%% (docs/DESIGN.md section 7, IEC 60870-5-5) rather than general interrogation.
+-spec is_counter(iec60870_asdu:type_name()) -> boolean().
+is_counter(m_it_na_1) -> true;
+is_counter(m_it_tb_1) -> true;
+is_counter(_) -> false.

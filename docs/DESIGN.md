@@ -1,11 +1,12 @@
 # IEC 60870 Erlang Library — Design
 
-Status: phases 0–6 implemented (skeleton + ASDU codec + APCI / single-connection
+Status: phases 0–7 implemented (skeleton + ASDU codec + APCI / single-connection
 state machine + default data model / interrogation / spontaneous path +
 commands / select-before-operate / clock sync + redundancy groups / switchover
-replay + TLS transport / 62351-3 defaults); phase 7 (counter interrogation,
-end-of-init, ...) is next. Authoritative copy; the published artifact is a
-rendered snapshot.
+replay + TLS transport / 62351-3 defaults + counter interrogation / end-of-init
+/ test command / background scan / read command / parameter of measured
+value); phase 8 (docs, examples, interop) is next. Authoritative copy; the
+published artifact is a rendered snapshot.
 
 ## 1. Scope
 
@@ -259,16 +260,21 @@ Pluggable via the `iec60870_data_model` behaviour; the library ships
                fun((Ioa, point(), Acc) -> Acc), Acc) -> Acc.
 -callback coas(State) -> [Coa].
 
-%% counters (for counter interrogation) — phase 7
--callback read_counter(State, Coa, Ioa) -> {ok, counter()} | not_found.
--callback freeze_counters(State, Coa, qcc()) -> {ok, State}.
+%% counter interrogation (phase 7, section 7): fold and freeze mirror
+%% fold/5, scoped to counter points (m_it_na_1 / m_it_tb_1,
+%% iec60870_point:is_counter/1) and their four counter groups instead of 1..16.
+-callback fold_counters(State, Coa, counter_group() | station,
+                        fun((Ioa, point(), Acc) -> Acc), Acc) -> Acc.
+-callback freeze_counters(State, Coa, counter_group() | station, freeze()) -> {ok, State}.
 ```
 
 `point()` is a map: `#{type := type_name(), value := term(),
 quality := [quality_flag()], ts := ms_since_epoch | undefined,
-group := 1..16 | undefined, qualifier => term()}` — see `iec60870_point`.
-Integrated totals (`m_it_*`) are stored but not `interrogable`; cyclic /
-background scan flags are deferred to phase 7.
+group := 1..16 | undefined, qualifier => term()}` — see `iec60870_point`. For a
+counter point `group` instead means the counter interrogation group 1..4 (the
+two meanings never collide since a point has exactly one type). Integrated
+totals (`m_it_*`) are stored but not `interrogable`; they answer to
+`fold_counters/5` instead (section 7).
 
 `iec60870_data_model:is_significant_change/2` is the shared no-change policy: a
 new IOA always counts; otherwise `write` reports `changed` only when the value
@@ -282,12 +288,15 @@ Two conceptually separate stores — do not conflate:
 | current values | per common address, shared across the server | answer interrogation; suppress no-change spontaneous events |
 | event queue | per redundancy group (§5) | spontaneous transmission + switchover replay |
 
-## 7. Commands (done)
+## 7. Commands and system procedures (done)
 
 The library runs **all protocol mechanics**; the callback module performs **only
 the semantic action** and may answer asynchronously. Implemented in
-`iec60870_server_ctl` (`command/3`, `clock_sync/3` and helpers); the pure
-decode/match/mirror pieces live in `iec60870_command`.
+`iec60870_server_ctl` (`command/3`, `clock_sync/3`, `counter_interrogate/3`,
+`read_command/3`, `test_command/3`, `set_parameter/3`, `activate_parameter/3`
+and helpers); the pure decode/match/mirror pieces for commands live in
+`iec60870_command`. The read command and test command are pure protocol
+mechanics with no semantic action, so neither has a callback.
 
 ### Callback behaviour (`iec60870_server` behaviour)
 
@@ -310,7 +319,15 @@ decode/match/mirror pieces live in `iec60870_command`.
       {ok, CbState}                     %% let the data model answer it (default)
     | {ok, [asdu_spec()], CbState}.     %% supply the dump explicitly
 
--callback counter_interrogation(Coa, qcc(), CbState) -> {ok, CbState}.
+-callback counter_interrogation(Coa, qcc(), CbState) ->
+      {ok, CbState}                     %% let the data model answer it (default)
+    | {ok, [asdu_spec()], CbState}.     %% supply the dump explicitly
+
+-callback set_parameter(Coa, Ioa, Value, qpm(), CbState) ->
+      {ok, CbState} | {error, iec60870_cot:cot(), CbState}.
+
+-callback activate_parameter(Coa, Ioa, qpa(), CbState) ->
+      {ok, CbState} | {error, iec60870_cot:cot(), CbState}.
 
 -callback connection_event(event(), CbState) -> {ok, CbState}.
       %% event() :: {up | down, peer()} | {activated | deactivated, group()}
@@ -325,8 +342,12 @@ transmission (typically `act_con`, or one of `unknown_type_id` /
 `unknown_cot` / `unknown_coa` / `unknown_ioa`); an invalid `Cot` falls back to
 `act_con` rather than crash the connection. No callback module, or one that
 doesn't export `select/2` / `execute/2`, rejects every command — accepting by
-default would be unsafe. A missing `clock_sync/3` instead **accepts** by
-default, since acknowledging a clock sync has no unsafe side effect.
+default would be unsafe. `set_parameter/5` / `activate_parameter/4` follow the
+same reject-by-default rule (a parameter write has a real behavioural effect,
+so silently no-op'ing it would be just as unsafe). A missing `clock_sync/3`
+instead **accepts** by default, since acknowledging a clock sync has no unsafe
+side effect; a missing `counter_interrogation/3` falls back to the library's
+own freeze + dump, same as `interrogation/3`.
 
 ### Interrogation (C_IC_NA_1) — library-driven
 
@@ -368,6 +389,83 @@ Feeding the kept clock offset into the timestamping of subsequently generated
 events is **not yet implemented** — a later phase threads it through
 `iec60870_point:to_object/3`; today the callback only observes the time.
 
+### Counter interrogation (C_CI_NA_1)
+
+Mirrors general interrogation with its own callback, fold and an explicit
+freeze step:
+
+1. recv `act` → validate COA and the QCC's RQT (`5` = station/general, `1..4`
+   = that counter group, anything else invalid)
+2. send `act_con`, P/N negative if invalid
+3. call `counter_interrogation/3`; the library default streams the current
+   counter values (`m_it_na_1` / `m_it_tb_1`, `iec60870_point:is_counter/1`)
+   with COT `interrogated_counter` (37) or `interrogated_counter_group_n`
+   (38–41), **then** applies the QCC's freeze qualifier
+   (`iec60870_data_model:freeze_counters/4`) — the dump always reports the
+   value at the moment of the command, and only `freeze_reset` / `reset` zero
+   the stored value, strictly *after* it was read out, so the next
+   interrogation sees the reset take effect rather than reporting it a step
+   early
+4. send `act_term`
+
+### Read command (C_RD_NA_1)
+
+No `act`/`act_con`/`act_term` — the controlling station's read command
+carries COT `request` (5, "used only by read command"); the reply is the
+addressed point's own type ASDU (from `iec60870_data_model:read/3`), also COT
+`request`, or a negative confirmation of the read command itself (COT
+`unknown_coa` / `unknown_ioa`) if the address doesn't resolve. Pure protocol
+mechanics — no callback.
+
+### Test command (C_TS_TA_1)
+
+A pure echo used to test the link at the ASDU layer: recv `act` → the same
+object (test pattern + CP56Time2a) mirrored back unchanged with `act_con`,
+P/N per whether the COA is known. No callback, no `act_term`.
+
+### End of initialization (M_EI_NA_1)
+
+Sent by this control process straight to a connection right after it
+activates (STARTDT done) — **not** buffered through the redundancy group
+(section 5), so it works the same way under all three `redundancy.mode`s
+instead of depending on a group already existing to receive it, and it is
+resent on every reactivation (including a reconnect), not just once at server
+startup. One ASDU per configured common address, `ioa = 0`, COT `initialized`
+(4). Config key `coi` (0..127, the cause-of-initialization byte, IEC 60870-5-4
+section 7.2.6.22) defaults to `0` ("local power switch on"); `coi => false`
+disables it for callers who manage M_EI by hand via `send_asdu/3`.
+
+Because a redundancy group can promote a newly-activated connection and
+replay its own buffered ASDUs to it in the same instant, the relay of the
+`activated` owner event from `iec60870_rgroup` to this control process is the
+one owner event relayed **synchronously** (`iec60870_server_ctl:relay_sync/3`,
+a `gen_server:call` rather than `relay/3`'s `cast`) — otherwise the group's
+direct, synchronous buffer replay could reach the connection before this
+control process's own (indirect, cast-relayed) M_EI send does, putting M_EI
+out of order on the wire. The synchronous call returns only once M_EI has
+already been dispatched to the connection, so the group's subsequent replay
+is guaranteed to queue up behind it.
+
+### Parameter of measured value / activation (P_ME_NA_1/NB_1/NC_1, P_AC_NA_1)
+
+Loads or activates a parameter at an IOA — same act/act_con/act_term shape as
+a direct-execute command (section 7), but no select-before-operate and no
+async form:
+
+- **P_ME_\*** (110–112): recv `act` → `set_parameter/5` (`Value` is the raw
+  i16/float like the matching measured-value type; `Qpm` is `#{kind =>
+  not_used | threshold_value | smoothing_factor | low_limit | high_limit |
+  0..63, in_operation => boolean(), local_change => boolean()}`, the decoded
+  QPM) → `act_con` (P/N per result) → `act_term` on success.
+- **P_AC_NA_1** (113): recv `act` → `activate_parameter/4` (`Qpa` is
+  `not_used | act_deact_parameter | act_deact_persistent_cyclic | 0..127`,
+  the decoded QPA) → `act_con` / `act_term` the same way.
+
+Neither type is stored in the data model — a parameter write's only effect is
+whatever the callback does with it (e.g. adjusting its own threshold logic);
+the value shown by a later read command / general interrogation of that IOA
+is unaffected unless the callback separately calls `iec60870_server:update/3`.
+
 ## 8. Sending information objects
 
 ### High level (default data model)
@@ -377,13 +475,22 @@ iec60870_server:update(Server, {Coa, Ioa}, #{
     type    => m_me_nc_1,
     value   => 3.14,
     quality => [],   %% [] | [invalid, not_topical, blocked, substituted, overflow]
-    ts      => erlang:system_time(millisecond)  %% omit for the "no timestamp" variant
+    ts      => erlang:system_time(millisecond),  %% omit for the "no timestamp" variant
+    cot     => spontaneous  %% or `background` — see below; defaults to spontaneous
 }).
 ```
 
 The library writes the current-value store and, **iff changed** (§6 —
 value or quality differs), builds a spontaneous ASDU (COT 3) and enqueues it
-into every redundancy group's buffer. On flush it batches objects of equal
+into every redundancy group's buffer. `cot => background` (COT 2) instead
+sends unconditionally, bypassing the change gate — a background scan reports
+the current value on a schedule regardless of whether it moved, unlike a
+change-driven spontaneous update. The library has no cyclic scan timer of its
+own (deliberately — the standard leaves the scan period to the station, and
+this library already has a natural place for the caller's own timer to drive
+from: the same `update/3` call site); a periodic background scan is the
+caller repeating an `update/3` with `cot => background` on its own schedule.
+On flush it batches objects of equal
 `{type, COA, COT}` into single ASDUs (≤ 249 octets; SQ=0, or SQ=1 sequence for
 contiguous IOAs — `iec60870_batch`), then hands them to each active connection
 subject to its `k` window and t1.
@@ -443,6 +550,7 @@ returns the per-server supervisor for embedding in a user tree;
 | Monitor | M_SP_NA_1 (1), M_SP_TB_1 (30), M_DP_NA_1 (3), M_DP_TB_1 (31), M_ST_NA_1 (5), M_ME_NA_1 (9), M_ME_NB_1 (11), M_ME_NC_1 (13), M_ME_TD_1 (34), M_ME_TE_1 (35), M_ME_TF_1 (36), M_IT_NA_1 (15), M_IT_TB_1 (37) |
 | Control | C_SC_NA_1 (45), C_DC_NA_1 (46), C_RC_NA_1 (47), C_SE_NA_1 / NB_1 / NC_1 (48–50) |
 | System | C_IC_NA_1 (100), C_CI_NA_1 (101), C_RD_NA_1 (102), C_CS_NA_1 (103), C_TS_TA_1 (107), M_EI_NA_1 (70) |
+| Parameter | P_ME_NA_1 (110), P_ME_NB_1 (111), P_ME_NC_1 (112), P_AC_NA_1 (113) |
 
 CP56Time2a only for timestamped variants; CP24Time2a / CP16Time2a not in v1.
 
@@ -561,7 +669,35 @@ the peer certificate.
    nothing committed to the repo) — mutual-auth success, a certless client
    rejected by the default, the `verify_none` opt-out accepting one, and a
    cipher outside the default list failing to negotiate.
-7. Counter interrogation, end-of-init, test command, background scan, read command, parameter of measured value.
+7. **Counter interrogation, end-of-init, test command, background scan, read
+   command, parameter of measured value (done):** all wired into
+   `iec60870_server_ctl` (section 7); the codec additions (P_ME_NA_1/NB_1/NC_1,
+   P_AC_NA_1, section 10) live in `iec60870_type` alongside the v1 set from
+   phase 1 — everything else the wire needs (C_CI_NA_1, C_RD_NA_1, C_TS_TA_1,
+   M_EI_NA_1) was already coded in phase 1, just not yet routed. New data-model
+   callbacks `fold_counters/5` + `freeze_counters/4` (section 6), implemented
+   in `iec60870_dm_ets`. `iec60870_rgroup` gained a second finding along the
+   way: the `activated` / `deactivated` owner events were never actually
+   relayed to `server_ctl` (only `{asdu,_}` / `{closed,_}` / `{decode_error,_}`
+   / `{outbox_overflow,_}` were) — dead code since phase 5 for
+   `connection_event/2`'s documented `{activated | deactivated, group()}`
+   event, surfaced by end-of-init needing that relay to fire. Fixed by
+   actually relaying both, with `activated` relayed **synchronously**
+   (`iec60870_server_ctl:relay_sync/3`) specifically to keep the M_EI send in
+   order ahead of a redundancy group's own (synchronous, same-process) buffer
+   replay to the same newly-promoted connection (section 7). eunit gained
+   `p_me_na_1`/`p_me_nb_1`/`p_me_nc_1`/`p_ac_na_1` cases in
+   `iec60870_type_tests` + `iec60870_prop_tests` (both now cover the full v1 +
+   parameter type set), `iec60870_point_tests` (`is_counter/1`),
+   `iec60870_dm_ets_tests` (fold/freeze counters); `iec60870_server_SUITE`
+   gained 17 cases (counter interrogation station/group/freeze-reset/
+   unknown-coa/explicit-dump, read command found/not-found/unknown-coa, test
+   command ok/unknown-coa, end-of-init on-connect/disabled, background scan,
+   parameter set ok/rejected/no-callback, parameter activate);
+   `iec60870_rgroup_SUITE` updated for the extra end-of-init I-frame every
+   activation now sends (its `active/1` helper drains it; two `ack/2` N(R)
+   values shift by one to account for the extra sequence number). eunit 141
+   (was 132), ct 59 (was 42), `rebar3 check` + `rebar3 ct` green.
 8. Docs, `examples/`, interop test vs `lib60870` / a real master.
 
 Then: **client** (reuses ASDU + APCI + a group-less connection). Then: **101**
