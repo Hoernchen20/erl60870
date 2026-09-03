@@ -1,12 +1,12 @@
 # IEC 60870 Erlang Library — Design
 
-Status: phases 0–7 implemented (skeleton + ASDU codec + APCI / single-connection
+Status: phases 0–8 implemented (skeleton + ASDU codec + APCI / single-connection
 state machine + default data model / interrogation / spontaneous path +
 commands / select-before-operate / clock sync + redundancy groups / switchover
 replay + TLS transport / 62351-3 defaults + counter interrogation / end-of-init
 / test command / background scan / read command / parameter of measured
-value); phase 8 (docs, examples, interop) is next. Authoritative copy; the
-published artifact is a rendered snapshot.
+value + docs / `examples/` / interop test vs `lib60870`); the 104 **client**
+is next. Authoritative copy; the published artifact is a rendered snapshot.
 
 ## 1. Scope
 
@@ -698,7 +698,41 @@ the peer certificate.
    activation now sends (its `active/1` helper drains it; two `ack/2` N(R)
    values shift by one to account for the extra sequence number). eunit 141
    (was 132), ct 59 (was 42), `rebar3 check` + `rebar3 ct` green.
-8. Docs, `examples/`, interop test vs `lib60870` / a real master.
+8. **Docs, `examples/`, interop test vs `lib60870` (done):** `examples/simple_rtu/`
+   (`simple_rtu.erl` + `simple_rtu_callback.erl`, plain modules outside the
+   rebar3 build graph — a library user compiles them by hand, they don't
+   pollute xref/dialyzer/ct) — one measured value and one
+   remote-controllable switch over the section 9 API, with a README on
+   running it and driving it from a test master. `README.md` gained a Quick
+   start and an Interop testing section; this file's status line updated.
+   `apps/iec60870/test/iec60870_interop_SUITE.erl` is the interop test
+   proper: it drives the server under test with `lib60870`'s **real** CS104
+   master implementation (<https://github.com/mz-automation/lib60870>)
+   rather than another hand-rolled raw-socket client. `init_per_suite`
+   shallow-clones a pinned release (`v2.4.1`) into
+   `filename:basedir(user_cache, "iec60870_interop")` and builds it with
+   `cmake` the first time it's needed (subsequent runs reuse the cached
+   `liblib60870.a`), then compiles
+   `apps/iec60870/test/interop/master_driver.c` against it — a small CS104
+   master program written for this suite, one scenario per test case chosen
+   by `argv` (`interrogate`, `test_command`, `direct_command`,
+   `select_before_operate`, `clock_sync`), printing a single `RESULT:
+   <scenario> ok|fail: <reason>` line instead of the stock example's loose
+   transcript so the suite can assert on it directly.
+   Any of that failing (no `git`/`cmake`/`make`/`gcc`, no network, a build
+   error) is `{skip, Reason}`, not a test failure, so `rebar3 ct` stays
+   green with no toolchain/network (a CT skip doesn't affect the run's exit
+   code); CI is expected to run it for real since `ubuntu-latest` has the
+   whole toolchain and normally has egress to GitHub. No CI workflow change
+   needed. eunit unchanged at 141 (phase 8 added no library code); ct 64
+   (was 59, +5 for the interop suite), `rebar3 check` + `rebar3 ct` green.
+   Found in passing, **not** caused by this phase and left alone as out of
+   scope: `iec60870_server_SUITE`'s `buffered_until_active` is a
+   pre-existing intermittent flake (confirmed independent of the interop
+   suite over several repeated `rebar3 ct` runs on this machine) —
+   `recv_asdu/1`'s fixed 2000 ms
+   `gen_tcp:recv` timeout (line ~614) is tight enough to occasionally lose
+   the race under load.
 
 Then: **client** (reuses ASDU + APCI + a group-less connection). Then: **101**
 (new link layer, same ASDU layer).
