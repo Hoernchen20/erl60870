@@ -1,39 +1,37 @@
-%%% @doc Redundancy group — one `gen_statem' per group (docs/DESIGN.md
-%%% section 5).
-%%%
-%%% A group owns a set of member {@link iec60870_104_conn} connections (it is
-%%% their `owner'), at most one of which is the group's <em>active</em>
-%%% connection — the one fed spontaneous / low-level traffic. It keeps an
-%%% ordered, bounded buffer of ASDUs awaiting transmission, each with a
-%%% monotonic index:
-%%%
-%%% <ul>
-%%%   <li>{@link enqueue/2} appends an ASDU; with an active connection it also
-%%%       goes out immediately (tagged with its index).</li>
-%%%   <li>`{released, Index}' from the active connection (the peer acknowledged
-%%%       the I-frame) drops every buffer entry up to `Index'.</li>
-%%%   <li>on promotion of a new active connection, transmission resumes from the
-%%%       last released index — sent-but-unacknowledged ASDUs are repeated.
-%%%       Duplicates on the wire during switchover are expected.</li>
-%%%   <li>with no active connection, events accumulate up to the bound
-%%%       (drop-oldest on overflow).</li>
-%%% </ul>
-%%%
-%%% Arbitration: when a member enters `active' (STARTDT) while another member is
-%%% already the active one, the group simply promotes the newcomer — the former
-%%% active connection stays open and keeps answering its own direct requests,
-%%% it is just no longer fed group traffic (the `active_standby' of
-%%% docs/DESIGN.md section 4 is tracked here, not as a connection state).
-%%%
-%%% Incoming ASDUs and connection lifecycle events (including `activated' /
-%%% `deactivated', docs/DESIGN.md section 7's `connection_event/2') are
-%%% relayed to the owning {@link iec60870_server_ctl}, looked up as
-%%% `{ctl, Name}' in {@link iec60870_registry}. `activated' specifically is
-%%% relayed *synchronously* ({@link iec60870_server_ctl:relay_sync/3}) so the
-%%% control process's own direct send to the newly-active connection (end of
-%%% initialization) cannot be overtaken by this module's own buffer replay to
-%%% that same connection just below.
 -module(iec60870_rgroup).
+-moduledoc """
+Redundancy group — one `gen_statem` per group (`docs/DESIGN.md` section 5).
+
+A group owns a set of member `m:iec60870_104_conn` connections (it is their
+`owner`), at most one of which is the group's *active* connection — the one
+fed spontaneous / low-level traffic. It keeps an ordered, bounded buffer of
+ASDUs awaiting transmission, each with a monotonic index:
+
+- `enqueue/2` appends an ASDU; with an active connection it also goes out
+  immediately (tagged with its index).
+- `{released, Index}` from the active connection (the peer acknowledged the
+  I-frame) drops every buffer entry up to `Index`.
+- on promotion of a new active connection, transmission resumes from the last
+  released index — sent-but-unacknowledged ASDUs are repeated. Duplicates on
+  the wire during switchover are expected.
+- with no active connection, events accumulate up to the bound (drop-oldest
+  on overflow).
+
+Arbitration: when a member enters `active` (STARTDT) while another member is
+already the active one, the group simply promotes the newcomer — the former
+active connection stays open and keeps answering its own direct requests,
+it is just no longer fed group traffic (the `active_standby` of
+`docs/DESIGN.md` section 4 is tracked here, not as a connection state).
+
+Incoming ASDUs and connection lifecycle events (including `activated` /
+`deactivated`, `docs/DESIGN.md` section 7's `connection_event/2`) are
+relayed to the owning `m:iec60870_server_ctl`, looked up as `{ctl, Name}` in
+`m:iec60870_registry`. `activated` specifically is relayed *synchronously*
+(`iec60870_server_ctl:relay_sync/3`) so the control process's own direct
+send to the newly-active connection (end of initialization) cannot be
+overtaken by this module's own buffer replay to that same connection just
+below.
+""".
 -behaviour(gen_statem).
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
@@ -65,7 +63,7 @@
     sent = 0                  :: non_neg_integer()
 }).
 
-%% State: `no_active' | `{active, ConnPid}'.
+-doc "State: `no_active` | `{active, ConnPid}`.".
 -type state() :: no_active | {active, pid()}.
 
 %%%===================================================================
@@ -76,18 +74,20 @@
 start_link(Id, Opts, Name) ->
     gen_statem:start_link(?MODULE, {Id, Opts, Name}, []).
 
-%% @doc Register `ConnPid' as a member of the group. Idempotent.
+-doc "Register `ConnPid` as a member of the group. Idempotent.".
 -spec add_member(gen_statem:server_ref(), pid()) -> ok.
 add_member(Group, ConnPid) when is_pid(ConnPid) ->
     gen_statem:call(Group, {add_member, ConnPid}).
 
-%% @doc Append an ASDU to the group's event buffer (and send it now if a
-%% connection is active).
+-doc """
+Append an ASDU to the group's event buffer (and send it now if a connection
+is active).
+""".
 -spec enqueue(gen_statem:server_ref(), #asdu{}) -> ok.
 enqueue(Group, #asdu{} = Asdu) ->
     gen_statem:cast(Group, {enqueue, Asdu}).
 
-%% @doc A snapshot of the group's state — for tests and debugging.
+-doc "A snapshot of the group's state — for tests and debugging.".
 -spec info(gen_statem:server_ref()) -> map().
 info(Group) ->
     gen_statem:call(Group, info).
@@ -306,9 +306,11 @@ relay_sync(Payload, Conn, #data{name = Name}) ->
 %%% Peer-address matching (`multiple' mode) — pure
 %%%===================================================================
 
-%% @doc The configured group id whose `match' list contains `PeerIp', or
-%% `DefaultId'. `Groups' is the `redundancy.groups' list; each entry is a map
-%% with `name' and a `match' list of `{ip, BaseAddr, PrefixLen}'.
+-doc """
+The configured group id whose `match` list contains `PeerIp`, or
+`DefaultId`. `Groups` is the `redundancy.groups` list; each entry is a map
+with `name` and a `match` list of `{ip, BaseAddr, PrefixLen}`.
+""".
 -spec match(inet:ip_address(), [map()], term()) -> term().
 match(PeerIp, Groups, DefaultId) ->
     case lists:search(fun(G) -> matches_any(PeerIp, maps:get(match, G, [])) end,

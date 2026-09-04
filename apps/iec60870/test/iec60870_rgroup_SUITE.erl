@@ -1,4 +1,4 @@
-%%% @doc Redundancy groups (docs/DESIGN.md section 5) driven end to end: a
+%%% Redundancy groups (docs/DESIGN.md section 5) driven end to end: a
 %%% library-managed server, one or more raw `gen_tcp' clients per test playing
 %%% controlling stations, exercising all three `redundancy.mode's, the
 %%% per-group event buffer and switchover replay.

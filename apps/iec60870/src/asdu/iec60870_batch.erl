@@ -1,21 +1,20 @@
-%%% @doc Pack many information objects into as few ASDUs as the wire allows
-%%% (docs/DESIGN.md section 8).
-%%%
-%%% Objects are grouped by an already-decided header `{Type, COA, COT}'. Within
-%%% a group this module:
-%%%
-%%% <ul>
-%%%   <li>drops duplicate IOAs (last write wins) and sorts ascending;</li>
-%%%   <li>emits a `SQ=1' ASDU for every maximal run of consecutive IOAs of
-%%%       length &gt;= 2 (chunked so the APDU stays within
-%%%       {@link iec60870_asdu:opts()} / the 249-octet ASDU limit and the
-%%%       127-object VSQ limit);</li>
-%%%   <li>packs everything else into `SQ=0' ASDUs.</li>
-%%% </ul>
-%%%
-%%% Pure and transport-free; shared by the interrogation dump and the
-%%% spontaneous `update/3' path.
 -module(iec60870_batch).
+-moduledoc """
+Pack many information objects into as few ASDUs as the wire allows
+(`docs/DESIGN.md` section 8).
+
+Objects are grouped by an already-decided header `{Type, COA, COT}`. Within
+a group this module:
+
+- drops duplicate IOAs (last write wins) and sorts ascending;
+- emits a `SQ=1` ASDU for every maximal run of consecutive IOAs of length
+  >= 2 (chunked so the APDU stays within `t:iec60870_asdu:opts/0` / the
+  249-octet ASDU limit and the 127-object VSQ limit);
+- packs everything else into `SQ=0` ASDUs.
+
+Pure and transport-free; shared by the interrogation dump and the spontaneous
+`iec60870_server:update/3` path.
+""".
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
@@ -27,9 +26,11 @@
 
 -define(MAX_OCTETS, ?IEC60870_ASDU_MAX_OCTETS).
 
-%% @doc Turn header-tagged object lists into ready-to-encode ASDUs. Groups are
-%% processed in the order given; within a group the sequence ASDUs come first,
-%% then the `SQ=0' remainder.
+-doc """
+Turn header-tagged object lists into ready-to-encode ASDUs. Groups are
+processed in the order given; within a group the sequence ASDUs come first,
+then the `SQ=0` remainder.
+""".
 -spec pack([{header(), [#object{}]}], iec60870_asdu:opts()) -> [#asdu{}].
 pack(Groups, Opts) ->
     lists:append([pack_group(H, Objs, Opts) || {H, Objs} <- Groups, Objs =/= []]).

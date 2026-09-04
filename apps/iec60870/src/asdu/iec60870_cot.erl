@@ -1,11 +1,13 @@
-%%% @doc Cause of transmission (COT) — the 6-bit code in the data-unit
-%%% identifier (IEC 60870-5-101 section 7.2.3, table).
-%%%
-%%% Atoms for the fixed causes; `{interrogated_group, 1..16}' and
-%%% `{interrogated_counter_group, 1..4}' for the two families that the standard
-%%% spreads over a range of codes. Any code the table does not name round-trips
-%%% as the raw integer.
 -module(iec60870_cot).
+-moduledoc """
+Cause of transmission (COT) — the 6-bit code in the data-unit identifier
+(IEC 60870-5-101 section 7.2.3, table).
+
+Atoms for the fixed causes; `{interrogated_group, 1..16}` and
+`{interrogated_counter_group, 1..4}` for the two families that the standard
+spreads over a range of codes. Any code the table does not name round-trips
+as the raw integer.
+""".
 
 -export([to_int/1, from_int/1]).
 
@@ -19,7 +21,7 @@
       | 0..63.
 -export_type([cot/0]).
 
-%% @doc COT term to its 6-bit code.
+-doc "COT term to its 6-bit code.".
 -spec to_int(cot()) -> 0..63.
 to_int(periodic)                        -> 1;
 to_int(background)                      -> 2;
@@ -47,7 +49,7 @@ to_int(unknown_ioa)                     -> 47;
 to_int(N) when is_integer(N), N >= 0, N =< 63 ->
     N.
 
-%% @doc 6-bit code to its COT term; unnamed codes stay integers.
+-doc "6-bit code to its COT term; unnamed codes stay integers.".
 -spec from_int(0..63) -> cot().
 from_int(1)  -> periodic;
 from_int(2)  -> background;

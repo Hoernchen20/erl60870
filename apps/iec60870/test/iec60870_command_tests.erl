@@ -1,4 +1,4 @@
-%%% @doc Unit tests for the pure command helpers (docs/DESIGN.md section 7).
+%%% Unit tests for the pure command helpers (docs/DESIGN.md section 7).
 -module(iec60870_command_tests).
 
 -include_lib("eunit/include/eunit.hrl").

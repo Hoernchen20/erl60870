@@ -1,21 +1,23 @@
-%%% @doc Instance name registry.
-%%%
-%%% Maps a user-supplied instance name to the pid of that instance's top
-%%% supervisor. Also implements the `{via, Module, Name}' callbacks
-%%% (`register_name/2', `unregister_name/1', `whereis_name/1', `send/2') so an
-%%% instance can be addressed with a standard OTP name spec.
-%%%
-%%% Also binds async-command references to their owning `iec60870_server_ctl'
-%%% (docs/DESIGN.md section 7), under the tagged key `{command, Ref}' so it
-%%% cannot collide with an instance name — `iec60870_server:command_result/2'
-%%% is handed only a `reference()' and needs to find the right server.
-%%%
-%%% Lookups read the ETS table directly and take no lock. Registration and
-%%% deregistration are serialised through the owning `gen_server', which also
-%%% monitors registered pids and drops their entries when they die (a crashed
-%%% `server_ctl' drops its command bindings the same way a crashed instance
-%%% supervisor drops its name).
 -module(iec60870_registry).
+-moduledoc """
+Instance name registry.
+
+Maps a user-supplied instance name to the pid of that instance's top
+supervisor. Also implements the `{via, Module, Name}` callbacks
+(`register_name/2`, `unregister_name/1`, `whereis_name/1`, `send/2`) so an
+instance can be addressed with a standard OTP name spec.
+
+Also binds async-command references to their owning `m:iec60870_server_ctl`
+(`docs/DESIGN.md` section 7), under the tagged key `{command, Ref}` so it
+cannot collide with an instance name — `iec60870_server:command_result/2`
+is handed only a `t:reference/0` and needs to find the right server.
+
+Lookups read the ETS table directly and take no lock. Registration and
+deregistration are serialised through the owning `gen_server`, which also
+monitors registered pids and drops their entries when they die (a crashed
+`server_ctl` drops its command bindings the same way a crashed instance
+supervisor drops its name).
+""".
 -behaviour(gen_server).
 
 -export([start_link/0]).
@@ -35,7 +37,7 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-%% @doc Bind `Name' to `Pid'. Returns `no' if `Name' is already bound.
+-doc "Bind `Name` to `Pid`. Returns `no` if `Name` is already bound.".
 -spec register_name(name(), pid()) -> yes | no.
 register_name(Name, Pid) when is_pid(Pid) ->
     gen_server:call(?MODULE, {register, Name, Pid}).
@@ -60,19 +62,23 @@ send(Name, Msg) ->
         Pid -> Pid ! Msg, Pid
     end.
 
-%% @doc All current bindings — for debugging and tests.
+-doc "All current bindings — for debugging and tests.".
 -spec names() -> [{name(), pid()}].
 names() ->
     ets:tab2list(?TAB).
 
-%% @doc Bind an async-command reference to the `server_ctl' pid that issued
-%% it, for {@link command_owner/1} to find later.
+-doc """
+Bind an async-command reference to the `server_ctl` pid that issued it, for
+`command_owner/1` to find later.
+""".
 -spec bind_command(reference(), pid()) -> ok.
 bind_command(Ref, Pid) when is_reference(Ref), is_pid(Pid) ->
     gen_server:call(?MODULE, {bind_command, Ref, Pid}).
 
-%% @doc The `server_ctl' pid a command reference was bound to, or `undefined'
-%% (never bound, already resolved, or its server is gone).
+-doc """
+The `server_ctl` pid a command reference was bound to, or `undefined` (never
+bound, already resolved, or its server is gone).
+""".
 -spec command_owner(reference()) -> pid() | undefined.
 command_owner(Ref) when is_reference(Ref) ->
     try ets:lookup(?TAB, {command, Ref}) of
@@ -82,7 +88,7 @@ command_owner(Ref) when is_reference(Ref) ->
         error:badarg -> undefined
     end.
 
-%% @doc Drop a command-reference binding once it is resolved.
+-doc "Drop a command-reference binding once it is resolved.".
 -spec unbind_command(reference()) -> ok.
 unbind_command(Ref) when is_reference(Ref) ->
     gen_server:call(?MODULE, {unbind_command, Ref}).

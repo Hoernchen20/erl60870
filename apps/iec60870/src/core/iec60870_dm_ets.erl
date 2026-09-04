@@ -1,20 +1,21 @@
-%%% @doc Default data model: one `public' ETS table, keyed `{COA, IOA}' ->
-%%% {@link iec60870_point:point()} (docs/DESIGN.md section 6).
-%%%
-%%% Not a process. `init/1' creates the table owned by its caller
-%%% (`iec60870_server_ctl'); reads and the interrogation fold hit ETS directly,
-%%% writes are serialised because that one caller is a `gen_server'. If the
-%%% owner restarts the table (and its point values) is rebuilt from `Args' —
-%%% acceptable for phase 3; a dedicated owner process can be split out later.
-%%%
-%%% `Args' is a map. `points' preloads the table:
-%%% <ul>
-%%%   <li>`[{{Coa, Ioa}, Spec}, ...]' — inline, `Spec' as in
-%%%       {@link iec60870_point:spec_to_point/1};</li>
-%%%   <li>`{file, Path}' or `Path' (a string) — `file:consult/1' a term file of
-%%%       the same entries (one per line, or a single list).</li>
-%%% </ul>
 -module(iec60870_dm_ets).
+-moduledoc """
+Default data model: one `public` ETS table, keyed `{COA, IOA}` ->
+`t:iec60870_point:point/0` (`docs/DESIGN.md` section 6).
+
+Not a process. `init/1` creates the table owned by its caller
+(`m:iec60870_server_ctl`); reads and the interrogation fold hit ETS directly,
+writes are serialised because that one caller is a `gen_server`. If the
+owner restarts the table (and its point values) is rebuilt from `Args` —
+acceptable for phase 3; a dedicated owner process can be split out later.
+
+`Args` is a map. `points` preloads the table:
+
+- `[{{Coa, Ioa}, Spec}, ...]` — inline, `Spec` as in
+  `iec60870_point:spec_to_point/1`;
+- `{file, Path}` or `Path` (a string) — `file:consult/1` a term file of the
+  same entries (one per line, or a single list).
+""".
 -behaviour(iec60870_data_model).
 
 -export([init/1, terminate/1, read/3, write/4, fold/5, coas/1,

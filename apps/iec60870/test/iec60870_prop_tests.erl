@@ -1,4 +1,4 @@
-%%% @doc Property: `decode(encode(ASDU)) == ASDU' for every v1 type id, across
+%%% Property: `decode(encode(ASDU)) == ASDU' for every v1 type id, across
 %%% the configurable COT / COA / IOA field widths and both structure qualifiers.
 -module(iec60870_prop_tests).
 

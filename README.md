@@ -68,7 +68,25 @@ rebar3 check      # compile + xref + dialyzer + eunit
 rebar3 ct         # common_test suites, including the interop one above
 ```
 
-Requires Erlang/OTP 26 or newer.
+Requires Erlang/OTP 27 or newer.
+
+## Documentation
+
+The API reference is written inline as OTP `-moduledoc` / `-doc` attributes and
+rendered to an HTML site with [ex_doc](https://github.com/elixir-lang/ex_doc):
+
+```
+rebar3 ex_doc
+```
+
+Output lands in `apps/iec60870/doc/` (open `index.html`); `README.md` and
+`docs/DESIGN.md` are included as guide pages. The plugin
+(`rebar3_ex_doc`, a `project_plugins` entry) is fetched automatically.
+
+Doc generation needs OTP **27**, or **28.1+** on the 28 line — ex_doc's
+Markdown parser is incompatible with the `re` module in OTP 28.0.x. Building on
+the library itself is unaffected. In an Erlang shell the same docs are
+available as `h(iec60870_server)`, etc. on any supported OTP.
 
 ## License
 

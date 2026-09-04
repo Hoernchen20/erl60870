@@ -1,5 +1,5 @@
-%%% @doc IEC 60870-5-104 connection state machine, driven over a real socket:
-%%% a ranch listener runs {@link iec60870_104_conn}, the suite plays the
+%%% IEC 60870-5-104 connection state machine, driven over a real socket:
+%%% a ranch listener runs iec60870_104_conn, the suite plays the
 %%% controlling station with a raw `gen_tcp' client.
 -module(iec60870_104_conn_SUITE).
 

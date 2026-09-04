@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        otp: ['26', '27', '28']
+        otp: ['27', '28']
 
     steps:
       - uses: actions/checkout@v4
@@ -40,3 +40,18 @@ jobs:
       - run: rebar3 eunit
       - run: rebar3 ct
       - run: rebar3 dialyzer
+
+  docs:
+    name: ex_doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          rebar3-version: '3'
+
+      # ex_doc's Markdown parser is incompatible with the OTP 28.0.x `re`
+      # module, so docs are built on OTP 27.
+      - run: rebar3 ex_doc

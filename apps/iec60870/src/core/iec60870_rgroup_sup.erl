@@ -1,13 +1,14 @@
-%%% @doc Supervisor for a server's redundancy groups (docs/DESIGN.md
-%%% sections 3, 5).
-%%%
-%%% `one_for_one'. For `redundancy.mode' `single' / `multiple' the configured
-%%% groups are permanent static children started here; for `connection' mode a
-%%% fresh temporary group is started per accepted connection via
-%%% {@link start_dynamic/4}. Registers itself as `{rgroup_sup, Name}' in
-%%% {@link iec60870_registry} so {@link iec60870_server_ctl} can find it
-%%% (they are siblings started in the same supervisor init).
 -module(iec60870_rgroup_sup).
+-moduledoc """
+Supervisor for a server's redundancy groups (`docs/DESIGN.md` sections 3, 5).
+
+`one_for_one`. For `redundancy.mode` `single` / `multiple` the configured
+groups are permanent static children started here; for `connection` mode a
+fresh temporary group is started per accepted connection via
+`start_dynamic/4`. Registers itself as `{rgroup_sup, Name}` in
+`m:iec60870_registry` so `m:iec60870_server_ctl` can find it (they are
+siblings started in the same supervisor init).
+""".
 -behaviour(supervisor).
 
 -export([start_link/2, start_dynamic/4, group_pid/2, which_groups/1]).
@@ -17,7 +18,7 @@
 start_link(Name, Config) ->
     supervisor:start_link(?MODULE, {Name, Config}).
 
-%% @doc Start a fresh temporary group for one connection (`connection' mode).
+-doc "Start a fresh temporary group for one connection (`connection` mode).".
 -spec start_dynamic(pid(), pos_integer(), term(), pid()) ->
         supervisor:startchild_ret().
 start_dynamic(Sup, BufferMax, Name, ConnPid) ->
@@ -30,7 +31,7 @@ start_dynamic(Sup, BufferMax, Name, ConnPid) ->
              modules => [iec60870_rgroup]},
     supervisor:start_child(Sup, Spec).
 
-%% @doc The pid of the static group with id `Id', or `undefined'.
+-doc "The pid of the static group with id `Id`, or `undefined`.".
 -spec group_pid(pid(), term()) -> pid() | undefined.
 group_pid(Sup, Id) ->
     case lists:keyfind(Id, 1, supervisor:which_children(Sup)) of
@@ -38,7 +39,7 @@ group_pid(Sup, Id) ->
         _ -> undefined
     end.
 
-%% @doc Every currently running group.
+-doc "Every currently running group.".
 -spec which_groups(pid()) -> [pid()].
 which_groups(Sup) ->
     [Pid || {_, Pid, _, _} <- supervisor:which_children(Sup), is_pid(Pid)].

@@ -1,29 +1,30 @@
-%%% @doc IEC 60870-5-104 connection — one `gen_statem' per accepted socket
-%%% (docs/DESIGN.md section 4).
-%%%
-%%% Runs the APCI protocol machinery: the STARTDT / STOPDT / TESTFR handshake,
-%%% the `k' / `w' flow-control window, the `t1' / `t2' / `t3' timers and the
-%%% 15-bit send/receive sequence numbers. Decoded ASDUs are handed to an owner
-%%% process and ASDUs to transmit are taken from it — see {@type owner_msg()}
-%%% and {@link send_asdu/2}.
-%%%
-%%% States:
-%%% <ul>
-%%%   <li>`connected' — socket up, data transfer stopped (STOPDT state). t3
-%%%       supervises the idle link; incoming I-frames are a protocol error.</li>
-%%%   <li>`active' — STARTDT completed, I/S-frames flow.</li>
-%%% </ul>
-%%%
-%%% The `active_standby' state of docs/DESIGN.md section 4 (a connection parked
-%%% by its redundancy group) arrives with phase 5.
-%%%
-%%% This module is the `ranch_protocol' callback; {@link iec60870_104_listener}
-%%% wires it to a listening socket. The `owner' listener option is either a
-%%% static pid (phase 2-4 style, and direct embedding) or a
-%%% `fun((PeerIp) -> {ok, pid()} | {error, term()})' resolved once per socket
-%%% just after `ranch:handshake' — that is how phase 5 assigns each connection
-%%% to its {@link iec60870_rgroup} by peer address.
 -module(iec60870_104_conn).
+-moduledoc """
+IEC 60870-5-104 connection — one `gen_statem` per accepted socket
+(`docs/DESIGN.md` section 4).
+
+Runs the APCI protocol machinery: the STARTDT / STOPDT / TESTFR handshake,
+the `k` / `w` flow-control window, the `t1` / `t2` / `t3` timers and the
+15-bit send/receive sequence numbers. Decoded ASDUs are handed to an owner
+process and ASDUs to transmit are taken from it — see `t:owner_msg/0` and
+`send_asdu/2`.
+
+States:
+
+- `connected` — socket up, data transfer stopped (STOPDT state). t3
+  supervises the idle link; incoming I-frames are a protocol error.
+- `active` — STARTDT completed, I/S-frames flow.
+
+The `active_standby` state of `docs/DESIGN.md` section 4 (a connection parked
+by its redundancy group) arrives with phase 5.
+
+This module is the `ranch_protocol` callback; `m:iec60870_104_listener`
+wires it to a listening socket. The `owner` listener option is either a
+static pid (phase 2-4 style, and direct embedding) or a
+`fun((PeerIp) -> {ok, pid()} | {error, term()})` resolved once per socket
+just after `ranch:handshake` — that is how phase 5 assigns each connection
+to its `m:iec60870_rgroup` by peer address.
+""".
 -behaviour(gen_statem).
 -behaviour(ranch_protocol).
 
@@ -48,7 +49,7 @@
                        | {socket_error, term()}
                        | {protocol_error, term()}.
 
-%% Messages the owner receives, all shaped `{iec60870, ConnPid, Payload}':
+-doc "Messages the owner receives, all shaped `{iec60870, ConnPid, Payload}`.".
 -type owner_msg() ::
         {iec60870, pid(), activated}
       | {iec60870, pid(), deactivated}
@@ -58,10 +59,12 @@
       | {iec60870, pid(), {outbox_overflow, non_neg_integer()}}
       | {iec60870, pid(), {closed, closed_reason()}}.
 
-%% An opaque per-ASDU tag supplied to {@link send_asdu/3}: the sender's own
-%% identifier (the redundancy group passes its buffer index), echoed back in a
-%% `{released, Tag}' owner message once the peer acknowledges the I-frame that
-%% carried it. `undefined' (from {@link send_asdu/2}) is never echoed.
+-doc """
+An opaque per-ASDU tag supplied to `send_asdu/3`: the sender's own identifier
+(the redundancy group passes its buffer index), echoed back in a
+`{released, Tag}` owner message once the peer acknowledges the I-frame that
+carried it. `undefined` (from `send_asdu/2`) is never echoed.
+""".
 -type send_tag() :: non_neg_integer() | undefined.
 -export_type([send_tag/0]).
 
@@ -113,20 +116,24 @@
 start_link(Ref, Transport, ProtoOpts) ->
     {ok, proc_lib:spawn_link(?MODULE, init, [{Ref, Transport, ProtoOpts}])}.
 
-%% @doc Queue an ASDU for transmission. It leaves as an I-frame once the
-%% connection is `active' and the `k' window has room; otherwise it waits.
+-doc """
+Queue an ASDU for transmission. It leaves as an I-frame once the connection
+is `active` and the `k` window has room; otherwise it waits.
+""".
 -spec send_asdu(gen_statem:server_ref(), #asdu{}) -> ok.
 send_asdu(Conn, #asdu{} = Asdu) ->
     send_asdu(Conn, Asdu, undefined).
 
-%% @doc As {@link send_asdu/2}, but tag the ASDU: once the peer acknowledges the
-%% I-frame that carries it the owner is sent `{iec60870, ConnPid, {released,
-%% Tag}}'. The redundancy group uses this to release its event buffer.
+-doc """
+As `send_asdu/2`, but tag the ASDU: once the peer acknowledges the I-frame
+that carries it the owner is sent `{iec60870, ConnPid, {released, Tag}}`. The
+redundancy group uses this to release its event buffer.
+""".
 -spec send_asdu(gen_statem:server_ref(), #asdu{}, send_tag()) -> ok.
 send_asdu(Conn, #asdu{} = Asdu, Tag) ->
     gen_statem:cast(Conn, {send_asdu, Asdu, Tag}).
 
-%% @doc Close the connection without notifying the owner (the owner asked).
+-doc "Close the connection without notifying the owner (the owner asked).".
 -spec stop(gen_statem:server_ref()) -> ok.
 stop(Conn) ->
     gen_statem:cast(Conn, stop).

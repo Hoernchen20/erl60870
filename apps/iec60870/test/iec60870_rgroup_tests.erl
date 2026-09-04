@@ -1,5 +1,5 @@
-%%% @doc eunit for the pure peer-address matcher used by `redundancy.mode =>
-%%% multiple' ({@link iec60870_rgroup:match/3}).
+%%% eunit for the pure peer-address matcher used by `redundancy.mode =>
+%%% multiple' (iec60870_rgroup:match/3).
 -module(iec60870_rgroup_tests).
 
 -include_lib("eunit/include/eunit.hrl").

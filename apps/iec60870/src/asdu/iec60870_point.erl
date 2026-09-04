@@ -1,28 +1,30 @@
-%%% @doc The public **point map** &lt;-&gt; internal `#object{}' bridge.
-%%%
-%%% The public API (docs/DESIGN.md section 8) describes a monitored information
-%%% point as a map:
-%%%
-%%% ```
-%%%   #{type  => m_me_nc_1,
-%%%     value => 3.14,
-%%%     quality => [],              %% [] | [invalid | not_topical | blocked |
-%%%                                 %%       substituted | overflow]
-%%%     ts    => 1_725_000_000_000, %% ms since the Unix epoch; omit / undefined
-%%%                                 %% for the no-timestamp variant
-%%%     group => 3}                 %% interrogation group 1..16, or undefined
-%%% '''
-%%%
-%%% For a counter (`m_it_na_1' / `m_it_tb_1', excluded from general
-%%% interrogation, see {@link is_counter/1}) `group' instead means the counter
-%%% interrogation group 1..4 (docs/DESIGN.md section 7) — the two families
-%%% never overlap on one point since a point has exactly one type.
-%%%
-%%% This module normalises such a map ({@link spec_to_point/1}) and turns a
-%%% stored point into the `#object{}' the codec consumes ({@link to_object/3}).
-%%% It is transport-free and lives in `src/asdu/' with the rest of the
-%%% application layer.
 -module(iec60870_point).
+-moduledoc """
+The public **point map** / internal `#object{}` bridge.
+
+The public API (`docs/DESIGN.md` section 8) describes a monitored information
+point as a map:
+
+```erlang
+#{type  => m_me_nc_1,
+  value => 3.14,
+  quality => [],              %% [] | [invalid | not_topical | blocked |
+                              %%       substituted | overflow]
+  ts    => 1_725_000_000_000, %% ms since the Unix epoch; omit / undefined
+                              %% for the no-timestamp variant
+  group => 3}                 %% interrogation group 1..16, or undefined
+```
+
+For a counter (`m_it_na_1` / `m_it_tb_1`, excluded from general interrogation,
+see `is_counter/1`) `group` instead means the counter interrogation group
+1..4 (`docs/DESIGN.md` section 7) — the two families never overlap on one
+point since a point has exactly one type.
+
+This module normalises such a map (`spec_to_point/1`) and turns a stored
+point into the `#object{}` the codec consumes (`to_object/3`). It is
+transport-free and lives in `src/asdu/` with the rest of the application
+layer.
+""".
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
@@ -33,9 +35,11 @@
 
 -type group() :: 1..16 | undefined.
 
-%% The stored form of one monitored point. `quality' is kept sorted so equal
-%% points compare equal; `qualifier' carries the type-specific extras
-%% (`#{transient => boolean()}' for step position, the BCR flags for counters).
+-doc """
+The stored form of one monitored point. `quality` is kept sorted so equal
+points compare equal; `qualifier` carries the type-specific extras
+(`#{transient => boolean()}` for step position, the BCR flags for counters).
+""".
 -type point() :: #{type := iec60870_asdu:type_name(),
                    value := term(),
                    quality := [iec60870_asdu:quality_flag()],
@@ -47,7 +51,7 @@
 %%% Normalisation
 %%%===================================================================
 
-%% @doc Fill a user-supplied spec map out to a full {@type point()}.
+-doc "Fill a user-supplied spec map out to a full `t:point/0`.".
 -spec spec_to_point(map()) -> point().
 spec_to_point(#{type := Type} = Spec) ->
     Base = #{type => Type,
@@ -80,8 +84,10 @@ default_qualifier(_, _) ->
 %%% Point -> #object{}
 %%%===================================================================
 
-%% @doc Build the information object for `Ioa' from a stored point. For a
-%% timestamped type with no `ts' the current system time is used.
+-doc """
+Build the information object for `Ioa` from a stored point. For a timestamped
+type with no `ts` the current system time is used.
+""".
 -spec to_object(iec60870_asdu:type_name(), non_neg_integer(), point()) -> #object{}.
 to_object(Type, Ioa, Point) ->
     Obj0 = #object{ioa = Ioa,
@@ -105,7 +111,7 @@ timestamp(Millis) when is_integer(Millis) ->
 %%% Type predicates
 %%%===================================================================
 
-%% @doc Whether a type id carries a CP56Time2a on the wire.
+-doc "Whether a type id carries a CP56Time2a on the wire.".
 -spec is_timestamped(iec60870_asdu:type_name()) -> boolean().
 is_timestamped(m_sp_tb_1) -> true;
 is_timestamped(m_dp_tb_1) -> true;
@@ -115,9 +121,11 @@ is_timestamped(m_me_tf_1) -> true;
 is_timestamped(m_it_tb_1) -> true;
 is_timestamped(_) -> false.
 
-%% @doc Whether a point of this type is returned by (general / group)
-%% interrogation. Integrated totals are excluded — they answer to counter
-%% interrogation (docs/DESIGN.md section 7, IEC 60870-5-5).
+-doc """
+Whether a point of this type is returned by (general / group) interrogation.
+Integrated totals are excluded — they answer to counter interrogation
+(`docs/DESIGN.md` section 7, IEC 60870-5-5).
+""".
 -spec interrogable(iec60870_asdu:type_name()) -> boolean().
 interrogable(m_sp_na_1) -> true;
 interrogable(m_dp_na_1) -> true;
@@ -132,8 +140,10 @@ interrogable(m_me_te_1) -> true;
 interrogable(m_me_tf_1) -> true;
 interrogable(_) -> false.
 
-%% @doc Whether a point of this type answers to counter interrogation
-%% (docs/DESIGN.md section 7, IEC 60870-5-5) rather than general interrogation.
+-doc """
+Whether a point of this type answers to counter interrogation
+(`docs/DESIGN.md` section 7, IEC 60870-5-5) rather than general interrogation.
+""".
 -spec is_counter(iec60870_asdu:type_name()) -> boolean().
 is_counter(m_it_na_1) -> true;
 is_counter(m_it_tb_1) -> true;

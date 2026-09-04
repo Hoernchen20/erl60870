@@ -1,5 +1,5 @@
-%%% @doc Application callback for the `iec60870' library.
 -module(iec60870_app).
+-moduledoc "Application callback for the `iec60870` library.".
 -behaviour(application).
 
 -export([start/2, stop/1]).

@@ -1,33 +1,32 @@
-%%% @doc IEC 60870-5-104 APCI — the application protocol control information that
-%%% frames every APDU on the wire, plus the 15-bit send/receive sequence-number
-%%% arithmetic (docs/DESIGN.md section 4).
-%%%
-%%% Transport-free and side-effect-free: `iec60870_104_conn' owns the socket and
-%%% the state machine; this module only turns frames into octets and back and
-%%% answers questions about sequence numbers.
-%%%
-%%% ```
-%%%   APDU = APCI (6 octets) + ASDU (0..249 octets)        ; APDU max 253
-%%%
-%%%   APCI:  68  LEN  CF1 CF2 CF3 CF4
-%%%          │   │    └──────────────  control field, format-dependent
-%%%          │   └─ octet count of CF1..CF4 + ASDU  (4..253)
-%%%          └─ start
-%%%
-%%%   I-format  CF1 bit0 = 0    N(S) in CF1(b1..7)+CF2, N(R) in CF3(b1..7)+CF4
-%%%   S-format  CF1 = 16#01     N(R) in CF3(b1..7)+CF4                 (ack only)
-%%%   U-format  CF1 bits1..0 = 11, one function bit set               (no seq)
-%%% '''
-%%%
-%%% Frames are represented as tagged tuples:
-%%%
-%%% <ul>
-%%%   <li>`{i, N(S), N(R), ASDU :: binary()}'</li>
-%%%   <li>`{s, N(R)}'</li>
-%%%   <li>`{u, startdt_act | startdt_con | stopdt_act | stopdt_con
-%%%          | testfr_act | testfr_con}'</li>
-%%% </ul>
 -module(iec60870_104_apci).
+-moduledoc """
+IEC 60870-5-104 APCI — the application protocol control information that
+frames every APDU on the wire, plus the 15-bit send/receive sequence-number
+arithmetic (`docs/DESIGN.md` section 4).
+
+Transport-free and side-effect-free: `m:iec60870_104_conn` owns the socket
+and the state machine; this module only turns frames into octets and back and
+answers questions about sequence numbers.
+
+```text
+  APDU = APCI (6 octets) + ASDU (0..249 octets)        ; APDU max 253
+
+  APCI:  68  LEN  CF1 CF2 CF3 CF4
+         │   │    └──────────────  control field, format-dependent
+         │   └─ octet count of CF1..CF4 + ASDU  (4..253)
+         └─ start
+
+  I-format  CF1 bit0 = 0    N(S) in CF1(b1..7)+CF2, N(R) in CF3(b1..7)+CF4
+  S-format  CF1 = 16#01     N(R) in CF3(b1..7)+CF4                 (ack only)
+  U-format  CF1 bits1..0 = 11, one function bit set               (no seq)
+```
+
+Frames are represented as tagged tuples:
+
+- `{i, N(S), N(R), ASDU :: binary()}`
+- `{s, N(R)}`
+- `{u, startdt_act | startdt_con | stopdt_act | stopdt_con | testfr_act | testfr_con}`
+""".
 
 -export([encode/1, decode/1]).
 -export([seq_succ/1, seq_add/2, seq_sub/2, seq_in_window/3]).
@@ -61,8 +60,10 @@
 %%% Encode
 %%%===================================================================
 
-%% @doc Serialise one frame into its complete APDU octets. Crashes on a
-%% malformed frame (a programming error); `decode/1' is the tolerant side.
+-doc """
+Serialise one frame into its complete APDU octets. Crashes on a malformed
+frame (a programming error); `decode/1` is the tolerant side.
+""".
 -spec encode(frame()) -> binary().
 encode({i, NS, NR, Asdu}) when is_binary(Asdu) ->
     Len = 4 + byte_size(Asdu),
@@ -89,11 +90,13 @@ u_code(testfr_con)  -> 16#83.
 %%% Decode
 %%%===================================================================
 
-%% @doc Peel one APDU off the front of a stream buffer.
-%%
-%% `{incomplete, N}' means at least `N' more octets are needed before a frame
-%% can be read; the caller keeps buffering. `{ok, Frame, Rest}' returns the
-%% frame and whatever octets followed it (the next frame, or a partial one).
+-doc """
+Peel one APDU off the front of a stream buffer.
+
+`{incomplete, N}` means at least `N` more octets are needed before a frame
+can be read; the caller keeps buffering. `{ok, Frame, Rest}` returns the
+frame and whatever octets followed it (the next frame, or a partial one).
+""".
 -spec decode(binary()) -> decode_result().
 decode(<<>>) ->
     {incomplete, 2};
@@ -136,22 +139,24 @@ u_function(_)     -> undefined.
 %%% 15-bit sequence-number arithmetic (modulo 32768)
 %%%===================================================================
 
-%% @doc The next sequence number after `N'.
+-doc "The next sequence number after `N`.".
 -spec seq_succ(seq()) -> seq().
 seq_succ(N) -> (N + 1) rem ?SEQ_MOD.
 
-%% @doc `N' advanced by `D' steps.
+-doc "`N` advanced by `D` steps.".
 -spec seq_add(seq(), non_neg_integer()) -> seq().
 seq_add(N, D) -> (N + D) rem ?SEQ_MOD.
 
-%% @doc The number of steps from `B' forward to `A' (0..32767).
+-doc "The number of steps from `B` forward to `A` (0..32767).".
 -spec seq_sub(seq(), seq()) -> seq().
 seq_sub(A, B) -> (A - B + ?SEQ_MOD) rem ?SEQ_MOD.
 
-%% @doc Whether `N' lies in the closed window `[Lo, Hi]' walking forward from
-%% `Lo'. Used to validate a received N(R) against `[ack, V(S)]': every value
-%% from "acknowledges nothing new" (`Lo') through "acknowledges everything
-%% outstanding" (`Hi') is legal, anything else means the peer lost sync.
+-doc """
+Whether `N` lies in the closed window `[Lo, Hi]` walking forward from `Lo`.
+Used to validate a received N(R) against `[ack, V(S)]`: every value from
+"acknowledges nothing new" (`Lo`) through "acknowledges everything
+outstanding" (`Hi`) is legal, anything else means the peer lost sync.
+""".
 -spec seq_in_window(seq(), seq(), seq()) -> boolean().
 seq_in_window(N, Lo, Hi) ->
     seq_sub(N, Lo) =< seq_sub(Hi, Lo).

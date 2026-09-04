@@ -1,11 +1,13 @@
-%%% @doc Application root supervisor.
-%%%
-%%% Owns two long-lived children (docs/DESIGN.md section 3):
-%%%
-%%%   * `iec60870_registry'       — instance name -> pid lookup
-%%%   * `iec60870_instances_sup'  — dynamic supervisor holding the per-instance
-%%%                                 subtrees created via `iec60870:start_server/2'
 -module(iec60870_sup).
+-moduledoc """
+Application root supervisor.
+
+Owns two long-lived children (`docs/DESIGN.md` section 3):
+
+- `m:iec60870_registry` — instance name -> pid lookup
+- `m:iec60870_instances_sup` — dynamic supervisor holding the per-instance
+  subtrees created via `iec60870:start_server/2`
+""".
 -behaviour(supervisor).
 
 -export([start_link/0]).

@@ -1,18 +1,20 @@
-%%% @doc APDU/ASDU wire codec and information-object builders.
-%%%
-%%% Transport-free: shared verbatim by the 104 and 101 stacks — 104 is the
-%%% companion standard of 101 and only the lower layers differ (docs/DESIGN.md
-%%% sections 2 and 10).
-%%%
-%%% An ASDU is the data-unit identifier (type id, variable structure qualifier,
-%%% cause of transmission, common address) followed by its information objects.
-%%% The field widths of the identifier and of the information object address are
-%%% configurable per link (docs/DESIGN.md section 9, `params'); pass them in
-%%% {@type opts()}, defaulting to the IEC 60870-5-104 norm (COT 2, COA 2, IOA 3).
-%%%
-%%% The `#asdu{}' / `#object{}' records (include/iec60870_asdu.hrl) are the
-%%% internal form; per-type payload dispatch lives in {@link iec60870_type}.
 -module(iec60870_asdu).
+-moduledoc """
+APDU/ASDU wire codec and information-object builders.
+
+Transport-free: shared verbatim by the 104 and 101 stacks — 104 is the
+companion standard of 101 and only the lower layers differ (`docs/DESIGN.md`
+sections 2 and 10).
+
+An ASDU is the data-unit identifier (type id, variable structure qualifier,
+cause of transmission, common address) followed by its information objects.
+The field widths of the identifier and of the information object address are
+configurable per link (`docs/DESIGN.md` section 9, `params`); pass them in
+`t:opts/0`, defaulting to the IEC 60870-5-104 norm (COT 2, COA 2, IOA 3).
+
+The `#asdu{}` / `#object{}` records (`include/iec60870_asdu.hrl`) are the
+internal form; per-type payload dispatch lives in `m:iec60870_type`.
+""".
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
@@ -44,8 +46,10 @@
 -export_type([type_name/0, cot_size/0, coa_size/0, ioa_size/0, quality_flag/0,
               opts/0, decode_error/0]).
 
-%% Type identification, as an atom. The raw integer is used for type ids the
-%% codec does not model. Kept in sync with docs/DESIGN.md section 10.
+-doc """
+Type identification, as an atom. The raw integer is used for type ids the
+codec does not model. Kept in sync with `docs/DESIGN.md` section 10.
+""".
 -type type_name() ::
         m_sp_na_1 | m_sp_tb_1
       | m_dp_na_1 | m_dp_tb_1
@@ -59,8 +63,10 @@
       | c_ic_na_1 | c_ci_na_1 | c_rd_na_1 | c_cs_na_1 | c_ts_ta_1
       | p_me_na_1 | p_me_nb_1 | p_me_nc_1 | p_ac_na_1.
 
-%% Configurable field widths of the data-unit identifier / IOA (docs/DESIGN.md
-%% section 9, `params').
+-doc """
+Configurable field widths of the data-unit identifier / IOA (`docs/DESIGN.md`
+section 9, `params`).
+""".
 -type cot_size() :: 1 | 2.
 -type coa_size() :: 1 | 2.
 -type ioa_size() :: 1 | 2 | 3.
@@ -72,7 +78,7 @@
                   coa_size => coa_size(),
                   ioa_size => ioa_size()}.
 
-%% `truncated' also covers a payload that is malformed for its type id.
+-doc "`truncated` also covers a payload that is malformed for its type id.".
 -type decode_error() :: {unsupported_type, 0..255} | truncated.
 
 -define(DEFAULTS, #{cot_size => 2, coa_size => 2, ioa_size => 3}).
@@ -81,12 +87,14 @@
 %%% Type identification
 %%%===================================================================
 
-%% @doc Type-identification atom to its integer code (integers pass through).
+-doc "Type-identification atom to its integer code (integers pass through).".
 -spec type_id(type_name() | 0..255) -> 0..255.
 type_id(Name) -> iec60870_type:name_to_id(Name).
 
-%% @doc Integer type-identification code to its atom (unmodelled codes stay
-%% integers).
+-doc """
+Integer type-identification code to its atom (unmodelled codes stay
+integers).
+""".
 -spec type_name(0..255) -> type_name() | 0..255.
 type_name(Id) -> iec60870_type:id_to_name(Id).
 
@@ -97,8 +105,10 @@ type_name(Id) -> iec60870_type:id_to_name(Id).
 -spec encode(#asdu{}) -> binary().
 encode(Asdu) -> encode(Asdu, #{}).
 
-%% @doc Serialise one `#asdu{}'. Crashes on a malformed record (a programming
-%% error); `decode/2' is the side that tolerates bad input.
+-doc """
+Serialise one `#asdu{}`. Crashes on a malformed record (a programming
+error); `decode/2` is the side that tolerates bad input.
+""".
 -spec encode(#asdu{}, opts()) -> binary().
 encode(#asdu{type = Type, cot = Cot, negative = Neg, test = Test,
              orig_addr = Orig, coa = Coa, sequence = SQ, objects = Objs},
@@ -138,9 +148,11 @@ objects(Type, false, IoaSz, Objs) ->
 -spec decode(binary()) -> {ok, #asdu{}, binary()} | {error, decode_error()}.
 decode(Bin) -> decode(Bin, #{}).
 
-%% @doc Parse one ASDU off the front of `Bin', returning the record and any
-%% bytes left over (for 104 the APCI layer hands an exact slice, so the
-%% remainder is normally empty).
+-doc """
+Parse one ASDU off the front of `Bin`, returning the record and any bytes
+left over (for 104 the APCI layer hands an exact slice, so the remainder is
+normally empty).
+""".
 -spec decode(binary(), opts()) -> {ok, #asdu{}, binary()} | {error, decode_error()}.
 decode(Bin, Opts) ->
     #{cot_size := CotSz, coa_size := CoaSz, ioa_size := IoaSz} = with_defaults(Opts),

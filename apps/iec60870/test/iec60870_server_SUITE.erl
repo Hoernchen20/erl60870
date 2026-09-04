@@ -1,4 +1,4 @@
-%%% @doc End-to-end: a library-managed server driven by a raw `gen_tcp' client
+%%% End-to-end: a library-managed server driven by a raw `gen_tcp' client
 %%% playing the controlling station. Covers interrogation (C_IC_NA_1), the
 %%% spontaneous `update/3' path, ASDU batching, commands (C_SC/C_DC/C_RC/C_SE,
 %%% direct + select-before-operate + async) and clock sync (C_CS_NA_1).

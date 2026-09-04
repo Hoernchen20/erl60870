@@ -1,10 +1,12 @@
-%%% @doc Example `iec60870_server' callback (docs/DESIGN.md section 7) for
-%%% `simple_rtu': IOA 100 is a remote-controllable switch. A C_SC_NA_1 single
-%%% command (direct execute, or select-before-operate) is accepted and its
-%%% value mirrored back into the data model via `iec60870_server:update/3',
-%%% so a later read command / interrogation reports the new state. Every
-%%% other command is rejected, and clock sync is always accepted.
 -module(simple_rtu_callback).
+-moduledoc """
+Example `m:iec60870_server` callback (`docs/DESIGN.md` section 7) for
+`simple_rtu`: IOA 100 is a remote-controllable switch. A C_SC_NA_1 single
+command (direct execute, or select-before-operate) is accepted and its
+value mirrored back into the data model via `iec60870_server:update/3`,
+so a later read command / interrogation reports the new state. Every
+other command is rejected, and clock sync is always accepted.
+""".
 -behaviour(iec60870_server).
 
 -export([init/1, select/2, execute/2, clock_sync/3, connection_event/2]).

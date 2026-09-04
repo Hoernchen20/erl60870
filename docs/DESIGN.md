@@ -13,7 +13,7 @@ is next. Authoritative copy; the published artifact is a rendered snapshot.
 - **Phase 1:** IEC 60870-5-104 **server** (controlled station), Edition 2 (2006), with redundancy.
 - **Phase 2:** IEC 60870-5-104 **client** (controlling station).
 - **Phase 3:** IEC 60870-5-101 (serial), reusing the shared application layer.
-- OTP 26+, rebar3, `ranch` for the acceptor and TLS transport.
+- OTP 27+, rebar3, `ranch` for the acceptor and TLS transport.
 - Multiple independent servers and clients per node, started and supervised by the
   user or by the library.
 
@@ -604,11 +604,11 @@ the peer certificate.
 | 5 | Data representation | maps at the public API, records internally |
 | 6 | Type ID scope | table in §10 |
 | 7 | Async commands | yes — `{async, Ref}` + `command_result/2` |
-| 8 | Tooling | rebar3, OTP 26+ |
+| 8 | Tooling | rebar3, OTP 27+ |
 
 ## 13. Implementation phases
 
-0. **Skeleton (done):** rebar3 umbrella, CI matrix (OTP 26–28) running
+0. **Skeleton (done):** rebar3 umbrella, CI matrix (OTP 27–28) running
    compile + xref + eunit + ct + dialyzer, `iec60870_asdu.hrl`, `ranch` dep,
    Apache-2.0 licence. App boots to `iec60870_sup` →
    {`iec60870_registry`, `iec60870_instances_sup`}.

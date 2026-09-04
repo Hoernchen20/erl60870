@@ -1,33 +1,33 @@
-%%% @doc Server control process — config, data model and callback state
-%%% (docs/DESIGN.md sections 4-8).
-%%%
-%%% One `gen_server' per server. It:
-%%%
-%%% <ul>
-%%%   <li>starts the `ranch' listener, handing each connection a resolver fun
-%%%       that assigns it to an {@link iec60870_rgroup} by peer address
-%%%       (interim — the listener is still started here, see the phase-3 note
-%%%       in docs/DESIGN.md section 3);</li>
-%%%   <li>owns the default data model's ETS table
-%%%       ({@link iec60870_dm_ets:init/1} runs in this process);</li>
-%%%   <li>answers station / group interrogation (C_IC_NA_1) from the data
-%%%       model, batched via {@link iec60870_batch};</li>
-%%%   <li>turns {@link iec60870_server:update/3} into spontaneous ASDUs and
-%%%       hands them to every redundancy group (each buffers / replays on its
-%%%       own — docs/DESIGN.md section 5);</li>
-%%%   <li>runs commands (C_SC/C_DC/C_RC/C_SE) — direct execute and
-%%%       select-before-operate, sync or async — clock sync (C_CS), counter
-%%%       interrogation (C_CI), the read command (C_RD), the test command
-%%%       (C_TS_TA_1) and parameter of measured value / parameter activation
-%%%       (P_ME_*/P_AC), docs/DESIGN.md section 7;</li>
-%%%   <li>sends the end-of-initialization ASDU (M_EI_NA_1, COT `initialized')
-%%%       to a connection right after it activates, config key `coi'.</li>
-%%% </ul>
-%%%
-%%% The redundancy groups own the connections; they {@link relay/3} incoming
-%%% ASDUs and connection lifecycle events here. Interrogation and command
-%%% replies are sent straight back on the requesting connection.
 -module(iec60870_server_ctl).
+-moduledoc """
+Server control process — config, data model and callback state
+(`docs/DESIGN.md` sections 4-8).
+
+One `gen_server` per server. It:
+
+- starts the `ranch` listener, handing each connection a resolver fun that
+  assigns it to an `m:iec60870_rgroup` by peer address (interim — the
+  listener is still started here, see the phase-3 note in `docs/DESIGN.md`
+  section 3);
+- owns the default data model's ETS table (`iec60870_dm_ets:init/1` runs in
+  this process);
+- answers station / group interrogation (C_IC_NA_1) from the data model,
+  batched via `m:iec60870_batch`;
+- turns `iec60870_server:update/3` into spontaneous ASDUs and hands them to
+  every redundancy group (each buffers / replays on its own —
+  `docs/DESIGN.md` section 5);
+- runs commands (C_SC/C_DC/C_RC/C_SE) — direct execute and
+  select-before-operate, sync or async — clock sync (C_CS), counter
+  interrogation (C_CI), the read command (C_RD), the test command
+  (C_TS_TA_1) and parameter of measured value / parameter activation
+  (P_ME_*/P_AC), `docs/DESIGN.md` section 7;
+- sends the end-of-initialization ASDU (M_EI_NA_1, COT `initialized`) to a
+  connection right after it activates, config key `coi`.
+
+The redundancy groups own the connections; they `relay/3` incoming ASDUs and
+connection lifecycle events here. Interrogation and command replies are sent
+straight back on the requesting connection.
+""".
 -behaviour(gen_server).
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
@@ -68,22 +68,25 @@
 start_link(Name, Config) ->
     gen_server:start_link(?MODULE, {Name, Config}, []).
 
-%% @doc Called by an {@link iec60870_rgroup} to hand an owner message
-%% (`{asdu, _}', `activated', `deactivated', `{closed, _}', ...) from one of
-%% its member connections up to this control process.
+-doc """
+Called by an `m:iec60870_rgroup` to hand an owner message (`{asdu, _}`,
+`activated`, `deactivated`, `{closed, _}`, ...) from one of its member
+connections up to this control process.
+""".
 -spec relay(pid(), pid(), term()) -> ok.
 relay(Ctl, Conn, Payload) ->
     gen_server:cast(Ctl, {owner_event, Conn, Payload}).
 
-%% @doc Like {@link relay/3}, but waits for this control process to have
-%% finished handling `Payload' before returning. Used only for `activated'
-%% (docs/DESIGN.md section 7, end of initialization): a redundancy group
-%% promoting a newly-activated connection replays its buffer to that same
-%% connection right after this call returns, and that replay must not
-%% overtake the end-of-initialization ASDU this control process sends
-%% directly to the connection while handling `activated' — a plain
-%% (asynchronous) `relay/3' gives no such ordering guarantee between the two
-%% independent senders.
+-doc """
+Like `relay/3`, but waits for this control process to have finished handling
+`Payload` before returning. Used only for `activated` (`docs/DESIGN.md`
+section 7, end of initialization): a redundancy group promoting a
+newly-activated connection replays its buffer to that same connection right
+after this call returns, and that replay must not overtake the
+end-of-initialization ASDU this control process sends directly to the
+connection while handling `activated` — a plain (asynchronous) `relay/3`
+gives no such ordering guarantee between the two independent senders.
+""".
 -spec relay_sync(pid(), pid(), term()) -> ok.
 relay_sync(Ctl, Conn, Payload) ->
     gen_server:call(Ctl, {owner_event, Conn, Payload}).
@@ -144,8 +147,8 @@ do_init(Name, Config, RgroupSup) ->
             {stop, {callback_failed, Reason}}
     end.
 
-%% One resolver fun per listener, called by each {@link iec60870_104_conn} with
-%% its peer IP to pick (or, for `connection' mode, spawn) its redundancy group.
+%% One resolver fun per listener, called by each iec60870_104_conn with
+%% its peer IP to pick (or, for `connection` mode, spawn) its redundancy group.
 make_resolver(Config, RgroupSup, Name) ->
     Red = maps:get(redundancy, Config, #{}),
     DefaultBuffer = maps:get(buffer, Red, 1000),
@@ -164,8 +167,8 @@ make_resolver(Config, RgroupSup, Name) ->
             end
     end.
 
-%% Runs in the connecting {@link iec60870_104_conn}'s init: pick the static
-%% group for `Id' and register this connection (`self()') as a member.
+%% Runs in the connecting iec60870_104_conn's init: pick the static
+%% group for `Id` and register this connection (`self()`) as a member.
 join(RgroupSup, Id) ->
     case iec60870_rgroup_sup:group_pid(RgroupSup, Id) of
         undefined ->

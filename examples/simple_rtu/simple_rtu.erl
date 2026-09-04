@@ -1,8 +1,10 @@
-%%% @doc Runnable example: a minimal RTU with one measured value (IOA 200, a
-%%% simulated temperature) and one remote-controllable switch (IOA 100),
-%%% docs/DESIGN.md section 9 config shape. See `examples/README.md' for how
-%%% to run it and drive it with a test master.
 -module(simple_rtu).
+-moduledoc """
+Runnable example: a minimal RTU with one measured value (IOA 200, a
+simulated temperature) and one remote-controllable switch (IOA 100),
+`docs/DESIGN.md` section 9 config shape. See `examples/README.md` for how
+to run it and drive it with a test master.
+""".
 
 -export([start/0, stop/0, tick/0]).
 
@@ -32,10 +34,12 @@ start() ->
 stop() ->
     iec60870:stop_server(?SERVER).
 
-%% @doc Publish a simulated temperature reading. Exported so
-%% `timer:apply_interval/4' can call it; also handy to call by hand from the
-%% shell to see a spontaneous ASDU go out immediately. A real RTU would read
-%% actual hardware here instead of a deterministic wave.
+-doc """
+Publish a simulated temperature reading. Exported so
+`timer:apply_interval/4` can call it; also handy to call by hand from the
+shell to see a spontaneous ASDU go out immediately. A real RTU would read
+actual hardware here instead of a deterministic wave.
+""".
 tick() ->
     Now = erlang:system_time(millisecond),
     Value = round((21.5 + 2 * math:sin(Now / 60000)) * 10) / 10,

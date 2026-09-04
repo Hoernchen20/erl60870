@@ -1,39 +1,36 @@
-%%% @doc Per-Type-ID dispatch: the atom <-> integer type map and the codec for
-%%% one information element's payload (everything after its information object
-%%% address).
-%%%
-%%% Scope is the v1 type set of docs/DESIGN.md section 10. Field formats follow
-%%% IEC 60870-5-101 section 7.3 and the element definitions of IEC 60870-5-4.
-%%% Every payload has a fixed length, so {@link decode_payload/3} returns the
-%%% object together with the bytes it did not consume.
-%%%
-%%% Value representation in `#object{}' (records are the internal form,
-%%% decision 5):
-%%%
-%%% <ul>
-%%%   <li>single point: `value' is a `boolean()'</li>
-%%%   <li>double point / command: `value' is `0..3' (the raw DPI/DCS/RCS code)</li>
-%%%   <li>step position: `value' is the position `-64..63',
-%%%       `qualifier' is `#{transient => boolean()}'</li>
-%%%   <li>normalized / scaled: `value' is the raw 16-bit signed integer
-%%%       (normalized fraction = value / 32768)</li>
-%%%   <li>short float: `value' is a `float()'</li>
-%%%   <li>integrated total: `value' is the 32-bit signed counter,
-%%%       `qualifier' is `#{sequence => 0..31, carry => boolean(),
-%%%       adjusted => boolean()}'</li>
-%%%   <li>commands: `qualifier' carries `#{select => boolean(), qu => 0..31}'
-%%%       (single/double/step) or `#{select => boolean(), ql => 0..127}'
-%%%       (set point)</li>
-%%%   <li>timestamped variants: `timestamp' is a `#cp56{}'</li>
-%%%   <li>parameter of measured value: `value' is the raw i16/float like the
-%%%       matching measured-value type, `qualifier' is `#{kind =>
-%%%       not_used|threshold_value|smoothing_factor|low_limit|high_limit|
-%%%       0..63, in_operation => boolean(), local_change => boolean()}'
-%%%       (QPM)</li>
-%%%   <li>parameter activation: `value' is `not_used|act_deact_parameter|
-%%%       act_deact_persistent_cyclic|0..127' (QPA)</li>
-%%% </ul>
 -module(iec60870_type).
+-moduledoc """
+Per-Type-ID dispatch: the atom/integer type map and the codec for one
+information element's payload (everything after its information object
+address).
+
+Scope is the v1 type set of `docs/DESIGN.md` section 10. Field formats follow
+IEC 60870-5-101 section 7.3 and the element definitions of IEC 60870-5-4.
+Every payload has a fixed length, so `decode_payload/3` returns the object
+together with the bytes it did not consume.
+
+Value representation in `#object{}` (records are the internal form,
+decision 5):
+
+- single point: `value` is a `t:boolean/0`
+- double point / command: `value` is `0..3` (the raw DPI/DCS/RCS code)
+- step position: `value` is the position `-64..63`, `qualifier` is
+  `#{transient => boolean()}`
+- normalized / scaled: `value` is the raw 16-bit signed integer (normalized
+  fraction = value / 32768)
+- short float: `value` is a `t:float/0`
+- integrated total: `value` is the 32-bit signed counter, `qualifier` is
+  `#{sequence => 0..31, carry => boolean(), adjusted => boolean()}`
+- commands: `qualifier` carries `#{select => boolean(), qu => 0..31}`
+  (single/double/step) or `#{select => boolean(), ql => 0..127}` (set point)
+- timestamped variants: `timestamp` is a `#cp56{}`
+- parameter of measured value: `value` is the raw i16/float like the matching
+  measured-value type, `qualifier` is `#{kind => not_used | threshold_value |
+  smoothing_factor | low_limit | high_limit | 0..63, in_operation =>
+  boolean(), local_change => boolean()}` (QPM)
+- parameter activation: `value` is `not_used | act_deact_parameter |
+  act_deact_persistent_cyclic | 0..127` (QPA)
+""".
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
@@ -108,9 +105,11 @@ id_to_name(112) -> p_me_nc_1;
 id_to_name(113) -> p_ac_na_1;
 id_to_name(N) when is_integer(N), N >= 0, N =< 255 -> N.
 
-%% @doc Fixed octet length of one information element's payload (everything
-%% after its information object address). Every v1 type has a constant width;
-%% used by {@link iec60870_batch} to size ASDUs.
+-doc """
+Fixed octet length of one information element's payload (everything after its
+information object address). Every v1 type has a constant width; used by
+`m:iec60870_batch` to size ASDUs.
+""".
 -spec payload_size(iec60870_asdu:type_name()) -> non_neg_integer().
 payload_size(m_sp_na_1) -> 1;
 payload_size(m_dp_na_1) -> 1;

@@ -1,4 +1,4 @@
-%%% @doc Wire-level interop test: our 104 server driven by `lib60870''s real
+%%% Wire-level interop test: our 104 server driven by `lib60870`'s real
 %%% CS104 master implementation (<https://github.com/mz-automation/lib60870>),
 %%% not a hand-rolled raw-socket client like the other `*_SUITE's — this is
 %%% the docs/DESIGN.md phase 8 "interop test vs lib60870" item.

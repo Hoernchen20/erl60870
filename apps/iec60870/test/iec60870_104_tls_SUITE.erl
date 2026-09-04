@@ -1,5 +1,5 @@
-%%% @doc TLS transport (IEC 62351-3, docs/DESIGN.md section 11): a ranch
-%%% listener runs {@link iec60870_104_conn} over `ranch_ssl'; the suite plays
+%%% TLS transport (IEC 62351-3, docs/DESIGN.md section 11): a ranch
+%%% listener runs iec60870_104_conn over `ranch_ssl`; the suite plays
 %%% the controlling station with a raw `ssl' client, using self-signed test
 %%% certificates generated once per suite by `public_key:pkix_test_data/1'
 %%% (server_chain / client_chain cross-trust each other's root).
@@ -81,8 +81,8 @@ mutual_tls_startdt_and_asdu(Config) ->
 %% never reaches the `active' state. In TLS 1.3 the server sends the whole
 %% first flight (through its own Finished) before ever seeing the client's
 %% Certificate, so a client-side `ssl:connect/4' can return `{ok, _}' even
-%% though the server-side `ranch:handshake/1' (and so {@link
-%% iec60870_104_conn} `init/1') fails and the connection never runs —
+%% though the server-side `ranch:handshake/1' (and so
+%% iec60870_104_conn `init/1') fails and the connection never runs —
 %% `activated' never arriving is the reliable signal, not the client's
 %% `connect' return value.
 client_without_cert_rejected(Config) ->

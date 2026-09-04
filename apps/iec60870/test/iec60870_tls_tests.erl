@@ -1,4 +1,4 @@
-%%% @doc IEC 62351-3 default merging (docs/DESIGN.md section 11).
+%%% IEC 62351-3 default merging (docs/DESIGN.md section 11).
 -module(iec60870_tls_tests).
 
 -include_lib("eunit/include/eunit.hrl").

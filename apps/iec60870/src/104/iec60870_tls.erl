@@ -1,20 +1,22 @@
-%%% @doc TLS transport defaults for IEC 62351-3 (docs/DESIGN.md section 11).
-%%%
-%%% {@link iec60870_104_listener} routes a `{tls, SslOpts}' transport config
-%%% through {@link server_opts/1} before handing it to `ranch_ssl' as
-%%% `socket_opts'. For every option the caller didn't already set, it fills in
-%%% the IEC 62351-3 defaults — TLS 1.2/1.3 only, mutual authentication
-%%% (`verify_peer' + `fail_if_no_peer_cert'), a forward-secret AEAD cipher
-%%% list, and the secure-104 port convention (19998). Caller-supplied options
-%%% always win, including CRL checking or a peer-cert allowlist via
-%%% `verify_fun' — that is plain OTP `ssl' pass-through, not implemented here.
-%%% Certificates (`cert(file)' / `key(file)' / `cacerts(file)') are always the
-%%% caller's; there is no library default for those.
-%%%
-%%% Passing `{verify, verify_none}' explicitly opts out of mutual auth (lab
-%%% use only) — the `fail_if_no_peer_cert' default is then skipped rather than
-%%% forced back on top of it.
 -module(iec60870_tls).
+-moduledoc """
+TLS transport defaults for IEC 62351-3 (`docs/DESIGN.md` section 11).
+
+`m:iec60870_104_listener` routes a `{tls, SslOpts}` transport config through
+`server_opts/1` before handing it to `ranch_ssl` as `socket_opts`. For every
+option the caller didn't already set, it fills in the IEC 62351-3 defaults —
+TLS 1.2/1.3 only, mutual authentication (`verify_peer` +
+`fail_if_no_peer_cert`), a forward-secret AEAD cipher list, and the
+secure-104 port convention (19998). Caller-supplied options always win,
+including CRL checking or a peer-cert allowlist via `verify_fun` — that is
+plain OTP `ssl` pass-through, not implemented here. Certificates
+(`cert(file)` / `key(file)` / `cacerts(file)`) are always the caller's;
+there is no library default for those.
+
+Passing `{verify, verify_none}` explicitly opts out of mutual auth (lab use
+only) — the `fail_if_no_peer_cert` default is then skipped rather than forced
+back on top of it.
+""".
 
 -export([server_opts/1]).
 
@@ -35,8 +37,10 @@
          "ECDHE-ECDSA-AES128-GCM-SHA256",
          "ECDHE-RSA-AES128-GCM-SHA256"]).
 
-%% @doc Fill in the IEC 62351-3 defaults for every option `Opts' doesn't
-%% already set.
+-doc """
+Fill in the IEC 62351-3 defaults for every option `Opts` doesn't already
+set.
+""".
 -spec server_opts(ranch_ssl:opts()) -> ranch_ssl:opts().
 server_opts(Opts) when is_list(Opts) ->
     Verify = proplists:get_value(verify, Opts, verify_peer),
