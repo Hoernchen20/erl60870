@@ -28,6 +28,11 @@ groups with switchover replay, and TLS (IEC 62351-3 defaults). The 104
 Then: the 104 **client**, then **IEC 60870-5-101** (a new serial link layer over
 the same ASDU layer).
 
+See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the full conformance
+tables: which ASDU type IDs are supported today (broken down by 101/104 and
+client/server), plus field widths, timers/flow control, redundancy group
+modes, and TLS defaults.
+
 ## Quick start
 
 ```erlang
