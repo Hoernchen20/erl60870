@@ -24,9 +24,9 @@ Point a controlling station at `localhost:2404`, common address 1. Any
 IEC 60870-5-104 test master works, including:
 
 - the interop driver built for `iec60870_interop_SUITE`
-  (`apps/iec60870/test/interop/master_driver.c` —
-  `_build/interop/master_driver 127.0.0.1 2404 interrogate`, see
-  `apps/iec60870/test/interop/README.md`);
+  (`apps/iec60870/test/interop/master_driver.c`; each `rebar3 ct` run of that
+  suite compiles it into the run's `priv_dir` under `_build/test/logs/`, and
+  it takes `<host> <port> <scenario>`, e.g. `127.0.0.1 2404 interrogate`);
 - `lib60870`'s own `cs104_client` example, built from
   <https://github.com/mz-automation/lib60870>.
 
