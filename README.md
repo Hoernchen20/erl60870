@@ -6,7 +6,7 @@
 An Erlang/OTP library for the **IEC 60870-5** telecontrol protocol family,
 starting with an **IEC 60870-5-104 server** (controlled station / RTU side).
 
-> **Status: 0.1.0, early release.** The 104 server is complete and
+> **Status: 0.2.0, early release.** The 104 server is complete and
 > tested against a third-party master ([lib60870](https://github.com/mz-automation/lib60870)).
 > The public API may still change before 1.0. The 104 client and
 > IEC 60870-5-101 (serial) are not implemented yet (see [Roadmap](#roadmap)).
@@ -42,7 +42,7 @@ The OTP application lives in `apps/iec60870`, so use `git_subdir`:
 ```erlang
 {deps, [
     {iec60870, {git_subdir, "https://github.com/Hoernchen20/erl60870.git",
-                {tag, "v0.1.0"}, "apps/iec60870"}}
+                {tag, "v0.2.0"}, "apps/iec60870"}}
 ]}.
 ```
 
@@ -141,6 +141,7 @@ rebar3 ct --suite=apps/iec60870/test/iec60870_interop_SUITE
 ## Roadmap
 
 - [x] IEC 60870-5-104 **server**, including TLS and redundancy groups (0.1.0)
+- [x] Point removal at runtime: `iec60870_server:remove/2` (0.2.0)
 - [ ] IEC 60870-5-104 **client** (controlling station)
 - [ ] IEC 60870-5-101 (serial link layer on top of the same ASDU layer)
 - [ ] Apply the clock-sync offset to generated timestamps

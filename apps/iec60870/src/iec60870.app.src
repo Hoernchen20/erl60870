@@ -1,6 +1,6 @@
 {application, iec60870, [
     {description, "IEC 60870-5 telecontrol protocol library (104 server first)"},
-    {vsn, "0.1.0"},
+    {vsn, "0.2.0"},
     {registered, [iec60870_sup, iec60870_registry, iec60870_instances_sup]},
     {mod, {iec60870_app, []}},
     {applications, [
