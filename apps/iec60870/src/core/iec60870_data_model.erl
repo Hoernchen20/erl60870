@@ -76,6 +76,15 @@ value); `freeze_reset` / `reset` zero it.
 """.
 -callback freeze_counters(state(), coa(), counter_group(), freeze()) -> {ok, state()}.
 
+-doc """
+Remove the point at `(Coa, Ioa)` (missing points are fine): it no longer
+answers interrogation or read commands, and a later write of it counts as new.
+Optional — without it `iec60870_server:remove/2` is ignored with a warning.
+""".
+-callback delete(state(), coa(), Ioa :: non_neg_integer()) -> {ok, state()}.
+
+-optional_callbacks([delete/3]).
+
 %%%===================================================================
 %%% Shared change policy
 %%%===================================================================

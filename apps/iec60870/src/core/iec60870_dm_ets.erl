@@ -18,7 +18,7 @@ acceptable for phase 3; a dedicated owner process can be split out later.
 """.
 -behaviour(iec60870_data_model).
 
--export([init/1, terminate/1, read/3, write/4, fold/5, coas/1,
+-export([init/1, terminate/1, read/3, write/4, delete/3, fold/5, coas/1,
          fold_counters/5, freeze_counters/4]).
 
 -type state() :: #{tab := ets:table()}.
@@ -58,6 +58,11 @@ write(#{tab := Tab} = State, Coa, Ioa, Point) ->
     Changed = iec60870_data_model:is_significant_change(Old, Point),
     true = ets:insert(Tab, {{Coa, Ioa}, Point}),
     {ok, State, Changed}.
+
+-spec delete(state(), iec60870_data_model:coa(), non_neg_integer()) -> {ok, state()}.
+delete(#{tab := Tab} = State, Coa, Ioa) ->
+    true = ets:delete(Tab, {Coa, Ioa}),
+    {ok, State}.
 
 -spec fold(state(), iec60870_data_model:coa(), iec60870_data_model:fold_group(),
            fun((non_neg_integer(), iec60870_point:point(), Acc) -> Acc), Acc) -> Acc.

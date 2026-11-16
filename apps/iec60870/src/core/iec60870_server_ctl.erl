@@ -188,6 +188,8 @@ handle_call(_Request, _From, State) ->
 
 handle_cast({update, Writes}, State) ->
     {noreply, do_update(Writes, State)};
+handle_cast({remove, Addrs}, State) ->
+    {noreply, do_remove(Addrs, State)};
 handle_cast({send_asdu, _Selector, Spec}, State) ->
     {noreply, dispatch([spec_to_asdu(Spec)], State)};
 handle_cast({command_result, Ref, Result}, State) ->
@@ -778,6 +780,23 @@ spontaneous_groups(Changed) ->
                       maps:update_with(Key, fun(L) -> [Obj | L] end, [Obj], Acc)
               end, #{}, Changed),
     maps:to_list(ByKey).
+
+%% Point removal: only the current-value store changes; nothing is sent
+%% (IEC 104 has no "point deleted" message), queued events stay as they are.
+do_remove(Addrs, #state{dm_mod = DmMod} = State) ->
+    case erlang:function_exported(DmMod, delete, 3) of
+        true ->
+            DmState = lists:foldl(
+                        fun({Coa, Ioa}, Acc) ->
+                                {ok, Acc1} = DmMod:delete(Acc, Coa, Ioa),
+                                Acc1
+                        end, State#state.dm_state, Addrs),
+            State#state{dm_state = DmState};
+        false ->
+            logger:warning("~p: data model ~p has no delete/3, ignoring removal of ~p points",
+                           [State#state.name, DmMod, length(Addrs)]),
+            State
+    end.
 
 %%%===================================================================
 %%% Dispatch

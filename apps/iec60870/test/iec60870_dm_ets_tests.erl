@@ -27,6 +27,35 @@ read_hit_and_miss_test() ->
     ok = iec60870_dm_ets:terminate(S).
 
 %%%===================================================================
+%%% delete
+%%%===================================================================
+
+delete_removes_point_test() ->
+    S = new(),
+    put_point(S, 1, 10, m_sp_na_1, true, undefined),
+    put_point(S, 1, 11, m_sp_na_1, true, undefined),
+    put_point(S, 2, 20, m_sp_na_1, true, undefined),
+    {ok, S1} = iec60870_dm_ets:delete(S, 1, 10),
+    ?assertEqual(not_found, iec60870_dm_ets:read(S1, 1, 10)),
+    ?assertEqual([11], fold_ioas(S1, 1, station)),
+    %% the last point of a COA takes the COA with it
+    {ok, S2} = iec60870_dm_ets:delete(S1, 2, 20),
+    ?assertEqual([1], iec60870_dm_ets:coas(S2)),
+    ok = iec60870_dm_ets:terminate(S2).
+
+delete_missing_is_ok_test() ->
+    S = new(),
+    ?assertMatch({ok, _}, iec60870_dm_ets:delete(S, 1, 99)),
+    ok = iec60870_dm_ets:terminate(S).
+
+rewrite_after_delete_is_a_change_test() ->
+    S = new(),
+    put_point(S, 1, 10, m_sp_na_1, true, undefined),
+    {ok, S1} = iec60870_dm_ets:delete(S, 1, 10),
+    ?assertMatch({ok, _, true}, iec60870_dm_ets:write(S1, 1, 10, point(m_sp_na_1, true))),
+    ok = iec60870_dm_ets:terminate(S1).
+
+%%%===================================================================
 %%% fold / coas
 %%%===================================================================
 

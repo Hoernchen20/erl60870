@@ -16,6 +16,8 @@
          no_frame_when_unchanged/1, bulk_update_batches/1,
          buffered_until_active/1, callback_explicit_dump/1]).
 
+-export([remove_point/1, remove_unknown_point/1, remove_is_ordered_with_updates/1,
+         remove_without_delete_callback/1]).
 -export([direct_single_command/1, direct_command_rejected/1,
          select_before_operate/1, select_rejected/1,
          operate_mismatched_select/1, select_timeout_expires/1,
@@ -59,7 +61,9 @@ all() ->
      test_command_ok, test_command_unknown_coa,
      end_of_init_on_connect, end_of_init_disabled, background_scan_always_sent,
      parameter_set_ok, parameter_set_rejected, parameter_set_no_callback,
-     parameter_activate_ok].
+     parameter_activate_ok,
+     remove_point, remove_unknown_point, remove_is_ordered_with_updates,
+     remove_without_delete_callback].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(iec60870),
@@ -116,6 +120,14 @@ server_config(TC, _TestPid) when TC =:= read_command_found;
                                  TC =:= read_command_not_found;
                                  TC =:= read_command_unknown_coa ->
     with_points([{{1, 100}, #{type => m_me_nc_1, value => 3.5}}]);
+server_config(TC, _TestPid) when TC =:= remove_point;
+                                 TC =:= remove_unknown_point;
+                                 TC =:= remove_is_ordered_with_updates ->
+    with_points([{{1, 100}, #{type => m_sp_na_1, value => true}},
+                 {{1, 101}, #{type => m_sp_na_1, value => false}},
+                 {{1, 200}, #{type => m_me_nc_1, value => 3.5}}]);
+server_config(remove_without_delete_callback, _TestPid) ->
+    (base_config())#{data_model => {iec60870_dm_nodelete, #{}}};
 server_config(end_of_init_disabled, _TestPid) ->
     (base_config())#{coi => false};
 server_config(_TC, _TestPid) ->
@@ -573,6 +585,58 @@ parameter_activate_ok(Config) ->
                  recv_asdu(S)),
     ?assertMatch(#asdu{type = p_ac_na_1, cot = act_term, negative = false},
                  recv_asdu(S)).
+
+%%%===================================================================
+%%% Point removal
+%%%===================================================================
+
+remove_point(Config) ->
+    Server = ?config(server, Config),
+    S = active(Config),
+    ok = iec60870_server:remove(Server, [{1, 100}, {1, 200}]),
+    %% no frame for a removal (IEC 104 has no "point deleted" message)
+    ok = expect_no_data(S, 300),
+    ?assertEqual([{101, false}], interrogate(S, 1)),
+    send_i(S, 1, 0, c_rd(1, 100)),
+    ?assertMatch(#asdu{type = c_rd_na_1, cot = unknown_ioa, negative = true}, recv_asdu(S)).
+
+remove_unknown_point(Config) ->
+    Server = ?config(server, Config),
+    S = active(Config),
+    ok = iec60870_server:remove(Server, [{1, 999}, {7, 1}]),
+    ?assertEqual([{100, true}, {101, false}, {200, 3.5}], interrogate(S, 1)).
+
+remove_is_ordered_with_updates(Config) ->
+    Server = ?config(server, Config),
+    S = active(Config),
+    %% update, remove, re-add: casts to the same process keep their order
+    ok = iec60870_server:update(Server, {1, 300}, #{type => m_sp_na_1, value => true}),
+    ok = iec60870_server:remove(Server, [{1, 300}]),
+    ?assertMatch(#asdu{objects = [#object{ioa = 300}]}, recv_asdu(S)),
+    ?assertEqual([{100, true}, {101, false}, {200, 3.5}], interrogate(S, 1)),
+    %% a re-added point is new again, so it is sent even with the same value
+    ok = iec60870_server:update(Server, {1, 100}, #{type => m_sp_na_1, value => true}),
+    ok = iec60870_server:remove(Server, [{1, 100}]),
+    ok = iec60870_server:update(Server, {1, 100}, #{type => m_sp_na_1, value => true}),
+    ?assertMatch(#asdu{cot = spontaneous, objects = [#object{ioa = 100, value = true}]},
+                 recv_asdu(S)).
+
+%% A data model without the optional delete/3: remove/2 is ignored, the
+%% server keeps running.
+remove_without_delete_callback(Config) ->
+    Server = ?config(server, Config),
+    S = active(Config),
+    ok = iec60870_server:update(Server, {1, 5}, #{type => m_sp_na_1, value => true}),
+    ?assertMatch(#asdu{objects = [#object{ioa = 5}]}, recv_asdu(S)),
+    ok = iec60870_server:remove(Server, [{1, 5}]),
+    ?assertEqual([{5, true}], interrogate(S, 1)).
+
+%% General interrogation of one COA, as sorted [{Ioa, Value}].
+interrogate(S, Coa) ->
+    send_i(S, 0, 0, c_ic(Coa, 20)),
+    ?assertMatch(#asdu{type = c_ic_na_1, cot = act_con}, recv_asdu(S)),
+    {Dump, _Term} = recv_dump(S, []),
+    dump_points(Dump).
 
 %%%===================================================================
 %%% Client helpers

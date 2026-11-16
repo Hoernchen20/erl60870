@@ -34,7 +34,7 @@ have no callback.
 
 -include_lib("iec60870/include/iec60870_asdu.hrl").
 
--export([start_link/1, update/2, update/3, send_asdu/3, listener_port/1,
+-export([start_link/1, update/2, update/3, remove/2, send_asdu/3, listener_port/1,
          command_result/2]).
 
 -export_type([server_ref/0, asdu_spec/0, conn_event/0]).
@@ -152,6 +152,16 @@ are batched into as few ASDUs as the wire allows.
 -spec update(server_ref(), [{{0..65535, non_neg_integer()}, map()}]) -> ok.
 update(Server, Writes) when is_list(Writes) ->
     gen_server:cast(ctl(Server), {update, Writes}).
+
+-doc """
+Remove points from the current-value store: they no longer answer
+interrogation or read commands, and a later `update/2` of the same address
+is sent as a new point. Nothing is transmitted. Ordered with `update/2`
+(same serialising process). Needs the data model's optional `delete/3`.
+""".
+-spec remove(server_ref(), [{0..65535, non_neg_integer()}]) -> ok.
+remove(Server, Addrs) when is_list(Addrs) ->
+    gen_server:cast(ctl(Server), {remove, Addrs}).
 
 -doc """
 Send a hand-built ASDU. `Selector` (`all | {group, _} | {coa, _}`) is
